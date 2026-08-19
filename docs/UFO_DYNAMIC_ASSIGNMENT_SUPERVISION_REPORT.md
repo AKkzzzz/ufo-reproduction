@@ -84,26 +84,64 @@ python main.py --config configs/dynamic_assignment_ab/lidar_anchor_500.json
 | Final dynamic PSNR | 16.9057 dB | 16.5841 dB |
 | Mean sec/iter | 1.479 | 1.566 |
 
-The A/B confirms that `lidar_anchor` removes the self-referential target collapse
-and supplies foreground gradients. It does not yet establish a production recipe:
-the learned anchor run still trended toward background by step 500, and it did not
-improve short-run RGB metrics. This points to an additional assignment-learning or
-class-imbalance issue rather than a remaining dependency of the GT on predicted
-geometry.
+The 500-step A/B confirms that `lidar_anchor` removes the self-referential target
+collapse and supplies foreground gradients. The short-run RGB difference is not
+evidence against the anchor because both runs are still early in the 5,000-step LR
+warmup.
+
+## Continuation to 5,000 steps
+
+Both 500-step checkpoints were resumed with their optimizer, loss scaler, RNG, and
+sampler state intact. No implementation or loss changes were made. Metrics below
+are means over the 100 optimizer steps immediately preceding each milestone.
+
+| Step | Mode | GT dynamic | Pred dynamic | FG recall | FG precision | Class loss | Bbox grad | Dynamic PSNR | Full PSNR |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1k | predicted_mean | 0.00% | 0.00% | N/A | N/A | 0.0000 | 0.0226 | 18.374 | 19.677 |
+| 1k | lidar_anchor | 6.70% | 22.17% | 66.41% | 25.07% | 0.5326 | 1.6094 | 17.622 | 18.030 |
+| 3k | predicted_mean | 0.00% | 0.00% | N/A | 0.00% | 0.0000 | 0.0197 | 17.433 | 18.808 |
+| 3k | lidar_anchor | 3.95% | 14.23% | 81.57% | 27.42% | 0.3809 | 2.0042 | 17.067 | 18.281 |
+| 5k | predicted_mean | 0.00% | 0.00% | N/A | 0.00% | 0.0000 | 0.0295 | 17.606 | 19.483 |
+| 5k | lidar_anchor | 7.85% | 21.36% | 77.12% | 31.36% | 0.5421 | 2.7751 | 17.646 | 19.164 |
+
+The predicted-mean path did not recover at any milestone. Its target, prediction,
+and object loss remained identically background through the end of warmup. The
+LiDAR-anchor path kept a healthy, independently observed foreground target and did
+not collapse: recall increased from 66.4% at 1k to 77.1% at 5k, precision increased
+from 25.1% to 31.4%, and bbox-head gradients remained substantial.
+
+The conditional `lidar_anchor + foreground/background balanced CE` experiment was
+not started because its trigger condition was not met. There is no 3k-5k evidence
+of learned assignment collapsing toward background under the current D50 stream.
+
+Twelve-scene held-out validation:
+
+| Step | predicted PSNR / SSIM / D-RMSE | anchor PSNR / SSIM / D-RMSE |
+|---:|---:|---:|
+| 1k | 17.807 / 0.4703 / 11.722 m | 17.149 / 0.4441 / 10.471 m |
+| 3k | 18.208 / 0.4916 / 13.358 m | 17.863 / 0.4728 / 12.352 m |
+| 5k | 18.877 / 0.4966 / 12.230 m | 18.360 / 0.4765 / 12.629 m |
+
+This validation path returned `NaN` for dynamic-region metrics in both runs, so it
+cannot support a learned-vs-control dynamic comparison. Training dynamic-mask
+metrics were finite and are reported above. The 5k checkpoint is produced at
+optimizer step 4,999; the current training loop would enable LPIPS on the next
+optimizer step, so LPIPS was not active in either compared window.
 
 Artifacts:
 
 - `outputs/dynamic_assignment_ab/real_sample_audit.json`
 - `outputs/dynamic_assignment_ab/predicted_mean_500/training_metrics.json`
 - `outputs/dynamic_assignment_ab/lidar_anchor_500/training_metrics.json`
-- checkpoints: each run's `ckpt_000499.pth`
+- continuation logs: each run's `continue_500_to_5000.log`
+- checkpoints: each run's `ckpt_000499.pth` through `ckpt_004999.pth`
 
 ## Recommendation
 
 The predicted-mean self-reference is a real public-v1 training failure in this
-setup. LiDAR anchors are a valid isolated reproduction candidate, but the 500-step
-result is not sufficient to switch the formal H200 2s 100k run. Do not synchronize
-this as the production training recipe yet. The next discriminating experiment is
-a short H200 confirmation that holds the anchor fixed and isolates object-loss
-balance or assignment-head learning, without changing geometry, rendering, or
-motion.
+setup and does not self-correct by 5k. The independent LiDAR anchor with an explicit
+valid/ignore mask is the supported assignment-GT reproduction decision. The 5k run
+does not justify foreground/background balanced CE because the learned assignment
+remained healthy through warmup. Before a formal 100k switch, synchronize only
+after review and reproduce a short H200 continuation with the same anchor policy;
+do not fall back to predicted means for missing LiDAR anchors.

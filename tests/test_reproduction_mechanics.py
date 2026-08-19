@@ -4,6 +4,8 @@ import torch
 
 from ufo.models.vit import Transformer
 from ufo.models.archs.small import (
+    build_lidar_token_anchors,
+    construct_assignment_targets,
     expand_spatial_token_assignments,
     points_in_boxes_probability,
     transform_gaussian_means_with_instances,
@@ -102,3 +104,58 @@ def test_token_assignment_broadcast_matches_spatial_patch():
     ]).float()
     torch.testing.assert_close(actual, expected)
 
+
+def test_lidar_anchor_token_camera_time_patch_and_children_mapping():
+    depth = torch.zeros(1, 2, 2, 4, 4)
+    origins = torch.zeros(1, 2, 2, 4, 4, 3)
+    directions = torch.zeros_like(origins)
+    directions[..., 2] = 1
+    depth[0, 1, 0, 2:4, 0:2] = 7
+    origins[0, 1, 0, ..., 0] = 100
+    anchors, valid = build_lidar_token_anchors(depth, origins, directions, patch_size=2)
+    # Flattening is time -> camera -> patch-row -> patch-column.
+    token_index = (((1 * 2 + 0) * 2 + 1) * 2 + 0)
+    assert valid[0, token_index]
+    torch.testing.assert_close(anchors[0, token_index], torch.tensor([100.0, 0.0, 7.0]))
+    token_weights = torch.arange(16).reshape(1, 2, 8, 1).float()
+    child_grid = expand_spatial_token_assignments(
+        token_weights, views=2, height=4, width=4, patch_size=2
+    )
+    assert child_grid[0, 1, 0, 2:4, 0:2].eq(token_index).all()
+
+
+def test_assignment_target_independence_from_predicted_geometry():
+    corners = torch.tensor([
+        [-1., -1., -1.], [1., -1., -1.], [-1., 1., -1.], [1., 1., -1.],
+        [-1., -1., 1.], [1., -1., 1.], [-1., 1., 1.], [1., 1., 1.],
+    ]).reshape(1, 1, 8, 3)
+    boxes_valid = torch.ones(1, 1)
+    predicted = torch.tensor([[[0., 0., 0.], [5., 5., 5.]]], requires_grad=True)
+    anchors = torch.tensor([[[0., 0., 0.], [5., 5., 5.]]], requires_grad=True)
+    anchor_valid = torch.ones(1, 2, dtype=torch.bool)
+    lidar_before, _ = construct_assignment_targets(
+        predicted, corners, boxes_valid, "lidar_anchor", anchors, anchor_valid
+    )
+    predicted_far = predicted.detach() + 1000
+    lidar_after, _ = construct_assignment_targets(
+        predicted_far, corners, boxes_valid, "lidar_anchor", anchors, anchor_valid
+    )
+    predicted_after, _ = construct_assignment_targets(
+        predicted_far, corners, boxes_valid, "predicted_mean"
+    )
+    torch.testing.assert_close(lidar_before, lidar_after)
+    assert lidar_before.argmax(-1)[0, 0] == 1
+    assert predicted_after.argmax(-1)[0, 0] == 0
+    assert not lidar_before.requires_grad
+
+
+def test_assignment_ce_has_finite_bbox_gradient_and_ignores_empty_anchor():
+    logits = torch.tensor([[[0.0, 0.2], [0.1, -0.3]]], requires_grad=True)
+    labels = torch.tensor([[1, 0]])
+    valid = torch.tensor([[True, False]])
+    loss = torch.nn.functional.cross_entropy(logits[valid], labels[valid])
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[0, 0].abs().sum() > 0
+    assert logits.grad[0, 1].abs().sum() == 0

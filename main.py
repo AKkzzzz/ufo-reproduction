@@ -302,9 +302,12 @@ def get_args_parser():
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
     parser.add_argument(
         "--object_assignment_gt_mode",
-        choices=["predicted_mean", "lidar_anchor"],
-        default="predicted_mean",
-        help="Public-v1 predicted mean or reproduction-decision LiDAR token anchor supervision.",
+        choices=["predicted_mean", "lidar_anchor", "lidar_token"],
+        default="lidar_token",
+        help=(
+            "Independent patch LiDAR-token supervision (default); lidar_anchor is "
+            "a compatibility alias and predicted_mean is deprecated diagnostics only."
+        ),
     )
     parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
     parser.add_argument("--dynamic_rich_pool", type=str, default=None)
@@ -381,6 +384,7 @@ def get_args_parser():
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--visualization_only", action="store_true")
     parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--skip_flow_evaluation", action="store_true")
     parser.add_argument("--skip_initial_validation", action="store_true")
     parser.add_argument("--skip_final_evaluation", action="store_true")
 
@@ -806,7 +810,7 @@ def main(args):
         if log_writer is not None and eval_result is not None:
             eval_result = {f"eval/{k}": v for k, v in eval_result.items()}
             log_writer.update(eval_result)
-        if args.dataset == "waymo":
+        if args.dataset == "waymo" and not args.skip_flow_evaluation:
             if args.decoder_type != "conv":
                 flow_eval_result = evaluate_flow(data_loader_eval_flow, model_without_ddp, args)
                 if log_writer is not None and flow_eval_result is not None:

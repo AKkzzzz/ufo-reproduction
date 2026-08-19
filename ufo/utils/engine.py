@@ -38,6 +38,21 @@ from reference_depth_eval import depth_evaluation
 logger = logging.getLogger("UFO")
 
 
+def evaluation_target_indices(num_timesteps, paper_frame_protocol):
+    """Select supervision targets without re-filtering paper-protocol windows."""
+    if paper_frame_protocol:
+        return list(range(num_timesteps))
+    return [idx for idx in range(num_timesteps) if idx % 5 != 0]
+
+
+def resize_binary_mask_nearest(mask, output_size):
+    """Resize a ``[..., H, W]`` mask without introducing fractional labels."""
+    shape = mask.shape
+    return F.interpolate(
+        mask.reshape(-1, 1, *shape[-2:]).float(), size=output_size, mode="nearest"
+    ).reshape(*shape[:-2], *output_size)
+
+
 @torch.no_grad()
 def visualize(args, model, dset_train, step, train_vis_id, device, dset_val=None, val_vis_id=None, log_writer=None):
     model.eval()
@@ -90,6 +105,7 @@ def evaluate(dataloader, model, args, name_str=None):
 
     # Initialize running sums and counts
     total_samples, total_dynamic_samples, total_valid_dynamic_depth_samples = 0, 0, 0
+    total_dynamic_frame_count, total_dynamic_pixel_count = 0, 0
     total_psnr, total_ssim, total_depth_rmse = 0.0, 0.0, 0.0
     total_occupied_psnr, total_occupied_ssim = 0.0, 0.0
     total_dynamic_psnr, total_dynamic_ssim, total_dynamic_rmse = 0.0, 0.0, 0.0
@@ -108,11 +124,6 @@ def evaluate(dataloader, model, args, name_str=None):
         mis_state = None
         prev_gs_time, prev_gs_dirs, prev_gs_origins = None, None, None
         prev_gs_c2w_global = None
-        pred_dict_list = []
-        input_dict_list = []
-        target_dict_list = []
-
-
         all_gs_features = {}
         posterior_gs_state_means = None
         posterior_gs_features = None
@@ -122,24 +133,8 @@ def evaluate(dataloader, model, args, name_str=None):
             range_inout = range(len(inout_dicts) - 1, -1, -1)
         else:
             range_inout = range(len(inout_dicts))
-        for i in range_inout:
-            ####================================forward pass==============================================
-            input_dict, target_dict = inout_dicts[i]
-            pred_dict, all_gs_features = update_scene(input_dict, model, scene=all_gs_features, export_ply=False, profile=True, filter_num=args.filter_num, log_dir=args.log_dir)
-
-
-
-        input_dict = pred_dict
-        ## OUT OF MEMORY HERE
-        # Process test_indices in batches to avoid OOM
-        num_timesteps = target_dict['target_image'].shape[1]
-        test_indices = [idx for idx in range(num_timesteps) if idx not in list(range(0, num_timesteps, 5))]
-
-        # Batch size for processing test_indices (adjust based on available memory)
-        batch_size = 5
-        num_batches = (len(test_indices) + batch_size - 1) // batch_size
-
-        # Collect all predictions and ground truths across batches
+        # Collect every recurrent chunk's supervision targets. Paper-protocol
+        # targets are already separated from context by the dataset.
         all_pred_rgb = []
         all_pred_depth = []
         all_gt_rgb = []
@@ -147,60 +142,71 @@ def evaluate(dataloader, model, args, name_str=None):
         all_gt_sky_mask = []
         all_gt_dynamic_mask = []
 
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(test_indices))
-            batch_test_indices = test_indices[start_idx:end_idx]
+        for i in range_inout:
+            input_dict, target_dict = inout_dicts[i]
+            render_source, all_gs_features = update_scene(
+                input_dict, model, scene=all_gs_features, export_ply=False,
+                profile=True, filter_num=args.filter_num, log_dir=args.log_dir,
+            )
+            num_timesteps = target_dict['target_image'].shape[1]
+            test_indices = evaluation_target_indices(
+                num_timesteps, getattr(args, "paper_frame_protocol", False)
+            )
+            if not test_indices:
+                logger.warning("No evaluation targets selected for recurrent chunk %d", i)
+                continue
 
-            # Create a copy of input_dict with only the current batch of target timesteps
-            batch_input_dict = {}
-            for key in input_dict:
-                if key.startswith('target_') and isinstance(input_dict[key], torch.Tensor):
-                    # Only select the batched timesteps for target data
-                    if input_dict[key].dim() >= 2:
-                        batch_input_dict[key] = input_dict[key][:, batch_test_indices]
+            render_batch_size = 5
+            num_batches = (len(test_indices) + render_batch_size - 1) // render_batch_size
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * render_batch_size
+                end_idx = min(start_idx + render_batch_size, len(test_indices))
+                batch_test_indices = test_indices[start_idx:end_idx]
+
+                batch_input_dict = {}
+                for key in render_source:
+                    if key.startswith('target_') and isinstance(render_source[key], torch.Tensor):
+                        if render_source[key].dim() >= 2:
+                            batch_input_dict[key] = render_source[key][:, batch_test_indices]
+                        else:
+                            batch_input_dict[key] = render_source[key]
                     else:
-                        batch_input_dict[key] = input_dict[key]
+                        batch_input_dict[key] = render_source[key]
+
+                batch_pred_dict = model(batch_input_dict, stage=3)
+                batch_rendered_results = batch_pred_dict["render_results"]
+                batch_pred_rgb = (
+                    batch_rendered_results[batch_rendered_results["rgb_key"]] * std + mean
+                ).detach()
+                if batch_rendered_results["decoder_depth_key"] is None:
+                    batch_pred_depth = batch_rendered_results[batch_rendered_results["depth_key"]]
                 else:
-                    # Keep non-target data as is
-                    batch_input_dict[key] = input_dict[key]
+                    batch_pred_depth = batch_rendered_results[
+                        batch_rendered_results["decoder_depth_key"]
+                    ]
 
-            # Render only the current batch
-            batch_pred_dict = model(batch_input_dict, stage=3)
-            
-            batch_rendered_results = batch_pred_dict["render_results"]
+                batch_gt_rgb = target_dict["target_image"][:, batch_test_indices]
+                batch_gt_rgb = batch_gt_rgb.permute(0, 1, 2, 4, 5, 3) * std + mean
+                batch_gt_depth = target_dict["target_depth"][:, batch_test_indices]
+                batch_gt_sky_mask = target_dict["target_sky_masks"][:, batch_test_indices]
+                batch_gt_dynamic_mask = target_dict.get("target_dynamic_masks")
+                if batch_gt_dynamic_mask is not None:
+                    batch_gt_dynamic_mask = batch_gt_dynamic_mask[:, batch_test_indices]
+                    batch_gt_dynamic_mask = resize_binary_mask_nearest(
+                        batch_gt_dynamic_mask, batch_gt_rgb.shape[-3:-1]
+                    )
 
-            # Extract predictions for this batch
-            batch_pred_rgb = batch_rendered_results[batch_rendered_results["rgb_key"]] * std + mean
-            batch_pred_rgb = batch_pred_rgb.detach()
+                all_pred_rgb.append(batch_pred_rgb)
+                all_pred_depth.append(batch_pred_depth)
+                all_gt_rgb.append(batch_gt_rgb)
+                all_gt_depth.append(batch_gt_depth)
+                all_gt_sky_mask.append(batch_gt_sky_mask)
+                all_gt_dynamic_mask.append(batch_gt_dynamic_mask)
+                torch.cuda.empty_cache()
 
-            if batch_rendered_results["decoder_depth_key"] is None:
-                batch_pred_depth = batch_rendered_results[batch_rendered_results["depth_key"]]
-            else:
-                batch_pred_depth = batch_rendered_results[batch_rendered_results["decoder_depth_key"]]
-
-            # Extract ground truth for this batch
-            batch_gt_rgb = target_dict["target_image"][:, batch_test_indices]
-            batch_gt_rgb = batch_gt_rgb.permute(0, 1, 2, 4, 5, 3) * std + mean
-
-            batch_gt_depth = target_dict["target_depth"][:, batch_test_indices]
-            batch_gt_sky_mask = target_dict["target_sky_masks"][:, batch_test_indices]
-
-            if "target_dynamic_masks" in target_dict:
-                batch_gt_dynamic_mask = target_dict["target_dynamic_masks"][:, batch_test_indices]
-            else:
-                batch_gt_dynamic_mask = None
-
-            # Accumulate results
-            all_pred_rgb.append(batch_pred_rgb)
-            all_pred_depth.append(batch_pred_depth)
-            all_gt_rgb.append(batch_gt_rgb)
-            all_gt_depth.append(batch_gt_depth)
-            all_gt_sky_mask.append(batch_gt_sky_mask)
-            all_gt_dynamic_mask.append(batch_gt_dynamic_mask)
-
-            # Clear GPU memory
-            torch.cuda.empty_cache()
+        if not all_pred_rgb:
+            logger.warning("Skipping sample with no selected supervision targets")
+            continue
 
         # Concatenate all batches
         pred_rgb = torch.cat(all_pred_rgb, dim=1)
@@ -209,7 +215,7 @@ def evaluate(dataloader, model, args, name_str=None):
         gt_depth = torch.cat(all_gt_depth, dim=1)
         gt_sky_mask = torch.cat(all_gt_sky_mask, dim=1)
 
-        if all_gt_dynamic_mask[0] is not None:
+        if all_gt_dynamic_mask and all(mask is not None for mask in all_gt_dynamic_mask):
             gt_dynamic_mask = torch.cat(all_gt_dynamic_mask, dim=1)
         else:
             gt_dynamic_mask = None
@@ -235,8 +241,10 @@ def evaluate(dataloader, model, args, name_str=None):
             gt_dynamic_mask = gt_dynamic_mask.view(-1, height, width)
             dynamic_mask = gt_dynamic_mask.bool()
         else:
-            dynamic_mask = torch.ones_like(occupied_mask)
+            dynamic_mask = torch.zeros_like(occupied_mask)
         valid_depth_mask = gt_depth > 0.0
+        total_dynamic_frame_count += int(dynamic_mask.flatten(1).any(dim=1).sum())
+        total_dynamic_pixel_count += int(dynamic_mask.sum())
 
         psnrs, ssim_scores, depth_rmses = [], [], []
         occupied_ssims, occupied_psnrs = [], []
@@ -367,8 +375,14 @@ def evaluate(dataloader, model, args, name_str=None):
             avg_occupied_psnr=fmt(total_occupied_psnr / total_samples),
             total_occupied_ssim=fmt(total_occupied_ssim / total_samples),
             avg_depth_rmse=fmt(total_depth_rmse / total_samples),
-            avg_dynamic_psnr=fmt(total_dynamic_psnr / total_dynamic_samples),
-            avg_dynamic_depth_rmse=fmt(total_dynamic_rmse / total_valid_dynamic_depth_samples),
+            avg_dynamic_psnr=(
+                fmt(total_dynamic_psnr / total_dynamic_samples)
+                if total_dynamic_samples else "NO_VALID_DYNAMIC_PIXELS"
+            ),
+            avg_dynamic_depth_rmse=(
+                fmt(total_dynamic_rmse / total_valid_dynamic_depth_samples)
+                if total_valid_dynamic_depth_samples else "NO_VALID_DYNAMIC_DEPTH"
+            ),
         )
 
     # Create tensors for sums and counts
@@ -385,6 +399,8 @@ def evaluate(dataloader, model, args, name_str=None):
     total_valid_dynamic_depth_samples_tensor = torch.tensor(
         total_valid_dynamic_depth_samples, device=device
     )
+    total_dynamic_frame_count_tensor = torch.tensor(total_dynamic_frame_count, device=device)
+    total_dynamic_pixel_count_tensor = torch.tensor(total_dynamic_pixel_count, device=device)
 
     # Comprehensive depth metrics tensors
     total_depth_abs_rel_tensor = torch.tensor(total_depth_abs_rel, device=device)
@@ -410,6 +426,8 @@ def evaluate(dataloader, model, args, name_str=None):
         torch.distributed.all_reduce(total_samples_tensor)
         torch.distributed.all_reduce(total_dynamic_samples_tensor)
         torch.distributed.all_reduce(total_valid_dynamic_depth_samples_tensor)
+        torch.distributed.all_reduce(total_dynamic_frame_count_tensor)
+        torch.distributed.all_reduce(total_dynamic_pixel_count_tensor)
 
         # Aggregate comprehensive depth metrics
         torch.distributed.all_reduce(total_depth_abs_rel_tensor)
@@ -426,11 +444,22 @@ def evaluate(dataloader, model, args, name_str=None):
         avg_depth_rmse = total_depth_rmse_tensor.item() / total_samples_tensor.item()
         avg_occupied_psnr = total_occupied_psnr_tensor.item() / total_samples_tensor.item()
         avg_occupied_ssim = total_occupied_ssim_tensor.item() / total_samples_tensor.item()
-        avg_dynamic_psnr = total_dynamic_psnr_tensor.item() / total_dynamic_samples_tensor.item()
-        avg_dynamic_ssim = total_dynamic_ssim_tensor.item() / total_dynamic_samples_tensor.item()
-        avg_dynamic_rmse = (
-            total_dynamic_rmse_tensor.item() / total_valid_dynamic_depth_samples_tensor.item()
+        dynamic_count = total_dynamic_samples_tensor.item()
+        dynamic_depth_count = total_valid_dynamic_depth_samples_tensor.item()
+        avg_dynamic_psnr = (
+            total_dynamic_psnr_tensor.item() / dynamic_count if dynamic_count else None
         )
+        avg_dynamic_ssim = (
+            total_dynamic_ssim_tensor.item() / dynamic_count if dynamic_count else None
+        )
+        avg_dynamic_rmse = (
+            total_dynamic_rmse_tensor.item() / dynamic_depth_count
+            if dynamic_depth_count else None
+        )
+        dynamic_status = "OK" if dynamic_count else "NO_VALID_DYNAMIC_PIXELS"
+
+        def _metric_text(value):
+            return f"{value:.4f}" if value is not None else dynamic_status
 
         # Compute comprehensive depth metric averages
         def _safe_avg(tensor, count_tensor):
@@ -449,12 +478,15 @@ def evaluate(dataloader, model, args, name_str=None):
             f.write(f"Average SSIM: {avg_ssim:.4f}\n")
             f.write(f"Average Occupied PSNR: {avg_occupied_psnr:.4f}\n")
             f.write(f"Average Occupied SSIM: {avg_occupied_ssim:.4f}\n")
-            f.write(f"Average Dynamic PSNR: {avg_dynamic_psnr:.4f}\n")
-            f.write(f"Average Dynamic SSIM: {avg_dynamic_ssim:.4f}\n")
+            f.write(f"Average Dynamic PSNR: {_metric_text(avg_dynamic_psnr)}\n")
+            f.write(f"Average Dynamic SSIM: {_metric_text(avg_dynamic_ssim)}\n")
+            f.write(f"Dynamic Status: {dynamic_status}\n")
+            f.write(f"Dynamic Frame Count: {int(total_dynamic_frame_count_tensor.item())}\n")
+            f.write(f"Dynamic Pixel Count: {int(total_dynamic_pixel_count_tensor.item())}\n")
 
             # Basic depth metrics
             f.write(f"Average Depth RMSE: {avg_depth_rmse:.4f}\n")
-            f.write(f"Average Dynamic Depth RMSE: {avg_dynamic_rmse:.4f}\n")
+            f.write(f"Average Dynamic Depth RMSE: {_metric_text(avg_dynamic_rmse)}\n")
 
             # Comprehensive depth metrics
             f.write(f"\nComprehensive Depth Metrics:\n")
@@ -473,7 +505,11 @@ def evaluate(dataloader, model, args, name_str=None):
             f"Average Occupied PSNR: {avg_occupied_psnr:.4f}, Average Occupied SSIM: {avg_occupied_ssim:.4f}"
         )
         logger.info(
-            f"Average Dynamic PSNR: {avg_dynamic_psnr:.4f}, Average Dynamic SSIM: {avg_dynamic_ssim:.4f}, Average Dynamic Depth RMSE: {avg_dynamic_rmse:.4f}"
+            "Average Dynamic PSNR: %s, Average Dynamic SSIM: %s, "
+            "Average Dynamic Depth RMSE: %s, frames=%d, pixels=%d, status=%s",
+            _metric_text(avg_dynamic_psnr), _metric_text(avg_dynamic_ssim),
+            _metric_text(avg_dynamic_rmse), int(total_dynamic_frame_count_tensor.item()),
+            int(total_dynamic_pixel_count_tensor.item()), dynamic_status,
         )
         logger.info(
             f"Comprehensive Depth Metrics - Abs Rel: {avg_depth_abs_rel:.4f}, Sq Rel: {avg_depth_sq_rel:.4f}, Log RMSE: {avg_depth_log_rmse:.4f}"
@@ -493,6 +529,9 @@ def evaluate(dataloader, model, args, name_str=None):
             # Basic depth metrics
             "depth_rmse": avg_depth_rmse,
             "dynamic_depth_rmse": avg_dynamic_rmse,
+            "dynamic_status": dynamic_status,
+            "dynamic_frame_count": int(total_dynamic_frame_count_tensor.item()),
+            "dynamic_pixel_count": int(total_dynamic_pixel_count_tensor.item()),
 
             # Comprehensive depth metrics from reference_depth_eval.py
             "depth_abs_rel": avg_depth_abs_rel,

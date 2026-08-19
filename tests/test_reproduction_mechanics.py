@@ -4,8 +4,9 @@ import torch
 
 from ufo.models.vit import Transformer
 from ufo.models.archs.small import (
-    build_lidar_token_anchors,
+    build_lidar_token_points,
     construct_assignment_targets,
+    construct_lidar_token_targets,
     expand_spatial_token_assignments,
     points_in_boxes_probability,
     transform_gaussian_means_with_instances,
@@ -13,6 +14,7 @@ from ufo.models.archs.small import (
 )
 from ufo.utils.losses import compute_lifespan_reg_loss
 from ufo.utils.misc import detach_tensors
+from ufo.utils.engine import evaluation_target_indices, resize_binary_mask_nearest
 
 
 def test_paper_lifespan_regularizer_is_inverse_beta():
@@ -112,11 +114,13 @@ def test_lidar_anchor_token_camera_time_patch_and_children_mapping():
     directions[..., 2] = 1
     depth[0, 1, 0, 2:4, 0:2] = 7
     origins[0, 1, 0, ..., 0] = 100
-    anchors, valid = build_lidar_token_anchors(depth, origins, directions, patch_size=2)
+    points, valid = build_lidar_token_points(depth, origins, directions, patch_size=2)
     # Flattening is time -> camera -> patch-row -> patch-column.
     token_index = (((1 * 2 + 0) * 2 + 1) * 2 + 0)
-    assert valid[0, token_index]
-    torch.testing.assert_close(anchors[0, token_index], torch.tensor([100.0, 0.0, 7.0]))
+    assert valid[0, token_index].all()
+    torch.testing.assert_close(
+        points[0, token_index], torch.tensor([100.0, 0.0, 7.0]).expand(4, 3)
+    )
     token_weights = torch.arange(16).reshape(1, 2, 8, 1).float()
     child_grid = expand_spatial_token_assignments(
         token_weights, views=2, height=4, width=4, patch_size=2
@@ -131,22 +135,52 @@ def test_assignment_target_independence_from_predicted_geometry():
     ]).reshape(1, 1, 8, 3)
     boxes_valid = torch.ones(1, 1)
     predicted = torch.tensor([[[0., 0., 0.], [5., 5., 5.]]], requires_grad=True)
-    anchors = torch.tensor([[[0., 0., 0.], [5., 5., 5.]]], requires_grad=True)
-    anchor_valid = torch.ones(1, 2, dtype=torch.bool)
+    lidar_points = torch.tensor(
+        [[[[0., 0., 0.], [0.5, 0., 0.]], [[5., 5., 5.], [6., 5., 5.]]]],
+        requires_grad=True,
+    )
+    point_valid = torch.ones(1, 2, 2, dtype=torch.bool)
     lidar_before, _ = construct_assignment_targets(
-        predicted, corners, boxes_valid, "lidar_anchor", anchors, anchor_valid
+        predicted, corners, boxes_valid, "lidar_anchor", lidar_points, point_valid
     )
     predicted_far = predicted.detach() + 1000
     lidar_after, _ = construct_assignment_targets(
-        predicted_far, corners, boxes_valid, "lidar_anchor", anchors, anchor_valid
+        predicted_far, corners, boxes_valid, "lidar_anchor", lidar_points, point_valid
+    )
+    lidar_token, _ = construct_assignment_targets(
+        predicted_far, corners, boxes_valid, "lidar_token", lidar_points, point_valid
     )
     predicted_after, _ = construct_assignment_targets(
         predicted_far, corners, boxes_valid, "predicted_mean"
     )
     torch.testing.assert_close(lidar_before, lidar_after)
+    torch.testing.assert_close(lidar_before, lidar_token)
     assert lidar_before.argmax(-1)[0, 0] == 1
     assert predicted_after.argmax(-1)[0, 0] == 0
     assert not lidar_before.requires_grad
+
+
+def test_lidar_token_targets_unique_background_empty_and_ambiguous():
+    unit_box = torch.tensor([
+        [-1., -1., -1.], [1., -1., -1.], [-1., 1., -1.], [1., 1., -1.],
+        [-1., -1., 1.], [1., -1., 1.], [-1., 1., 1.], [1., 1., 1.],
+    ])
+    boxes = torch.stack((unit_box, unit_box + torch.tensor([4., 0., 0.])))[None]
+    points = torch.tensor([[[
+        [0., 0., 0.], [10., 0., 0.],
+    ], [
+        [10., 0., 0.], [11., 0., 0.],
+    ], [
+        [0., 0., 0.], [4., 0., 0.],
+    ], [
+        [0., 0., 0.], [0., 0., 0.],
+    ]]]).float()
+    point_valid = torch.tensor([[[True, True], [True, True], [True, True], [False, False]]])
+    probabilities, supervised = construct_lidar_token_targets(
+        points, point_valid, boxes, torch.ones(1, 2)
+    )
+    assert probabilities.argmax(-1).tolist() == [[1, 0, 0, 0]]
+    assert supervised.tolist() == [[True, True, False, False]]
 
 
 def test_assignment_ce_has_finite_bbox_gradient_and_ignores_empty_anchor():
@@ -159,3 +193,16 @@ def test_assignment_ce_has_finite_bbox_gradient_and_ignores_empty_anchor():
     assert torch.isfinite(logits.grad).all()
     assert logits.grad[0, 0].abs().sum() > 0
     assert logits.grad[0, 1].abs().sum() == 0
+
+
+def test_paper_evaluation_keeps_all_supervision_targets():
+    assert evaluation_target_indices(6, paper_frame_protocol=True) == [0, 1, 2, 3, 4, 5]
+    assert evaluation_target_indices(6, paper_frame_protocol=False) == [1, 2, 3, 4]
+
+
+def test_dynamic_mask_resize_is_nearest_and_binary():
+    mask = torch.tensor([[[[0, 1], [1, 0]]]], dtype=torch.float32)
+    resized = resize_binary_mask_nearest(mask, (4, 4))
+    assert resized.shape == (1, 1, 4, 4)
+    assert set(resized.unique().tolist()) == {0.0, 1.0}
+    assert resized.sum() == 8

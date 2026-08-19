@@ -191,39 +191,83 @@ def expand_spatial_token_assignments(token_weights, views, height, width, patch_
     return weights.repeat_interleave(patch_size, 3).repeat_interleave(patch_size, 4)
 
 
-def build_lidar_token_anchors(depth, origins, directions, patch_size=8):
-    """Build one observation-derived world-space anchor per image patch token.
+def build_lidar_token_points(depth, origins, directions, patch_size=8):
+    """Build observation-derived world points for every image patch token.
 
     Waymo depth is camera-Z. ``directions`` is the unnormalized pinhole ray
     whose camera-frame Z component is one, so ``origin + direction * depth``
-    reconstructs the world point without using predicted Gaussian geometry.
-    Empty patches are returned as invalid and must be ignored by assignment CE.
+    reconstructs world points without using predicted Gaussian geometry. Points
+    remain separate within each patch so foreground/background mixtures are not
+    collapsed into a noisy averaged anchor.
     """
     if depth.shape != origins.shape[:-1] or origins.shape != directions.shape:
         raise ValueError("depth/origin/direction shapes are inconsistent")
     if depth.shape[-2] % patch_size or depth.shape[-1] % patch_size:
         raise ValueError("image dimensions must be divisible by patch_size")
-    valid = torch.isfinite(depth) & (depth > 0)
+    point_valid = torch.isfinite(depth) & (depth > 0)
     points = origins + directions * depth[..., None]
-    flat_points = rearrange(
-        points * valid[..., None], "b t v h w c -> (b t v) c h w"
+    token_points = rearrange(
+        points,
+        "b t v (ph p1) (pw p2) c -> b (t v ph pw) (p1 p2) c",
+        p1=patch_size,
+        p2=patch_size,
     )
-    flat_valid = rearrange(valid.float(), "b t v h w -> (b t v) 1 h w")
-    point_sum = F.avg_pool2d(flat_points, patch_size, patch_size)
-    valid_fraction = F.avg_pool2d(flat_valid, patch_size, patch_size)
-    anchor = point_sum / valid_fraction.clamp_min(1.0 / (patch_size ** 2))
-    b, t, v = depth.shape[:3]
-    anchors = rearrange(
-        anchor, "(b t v) c ph pw -> b (t v ph pw) c", b=b, t=t, v=v
+    token_point_valid = rearrange(
+        point_valid,
+        "b t v (ph p1) (pw p2) -> b (t v ph pw) (p1 p2)",
+        p1=patch_size,
+        p2=patch_size,
     )
-    anchor_valid = rearrange(
-        valid_fraction > 0,
-        "(b t v) 1 ph pw -> b (t v ph pw)",
-        b=b,
-        t=t,
-        v=v,
-    )
-    return anchors.detach(), anchor_valid.detach()
+    return token_points.detach(), token_point_valid.detach()
+
+
+def points_in_boxes_mask(points, boxes, valid_boxes):
+    """Return hard oriented-box membership for points shaped ``[B, ..., 3]``."""
+    batch = points.shape[0]
+    flat_points = points.reshape(batch, -1, 3)
+    centers = boxes.mean(dim=2)
+    x_axis = (
+        boxes[:, :, 1] - boxes[:, :, 0] + boxes[:, :, 3] - boxes[:, :, 2]
+        + boxes[:, :, 5] - boxes[:, :, 4] + boxes[:, :, 7] - boxes[:, :, 6]
+    ) / 4.0
+    y_axis = (
+        boxes[:, :, 2] - boxes[:, :, 0] + boxes[:, :, 3] - boxes[:, :, 1]
+        + boxes[:, :, 6] - boxes[:, :, 4] + boxes[:, :, 7] - boxes[:, :, 5]
+    ) / 4.0
+    z_axis = (
+        boxes[:, :, 4] - boxes[:, :, 0] + boxes[:, :, 5] - boxes[:, :, 1]
+        + boxes[:, :, 6] - boxes[:, :, 2] + boxes[:, :, 7] - boxes[:, :, 3]
+    ) / 4.0
+    axes = torch.stack((x_axis, y_axis, z_axis), dim=-2)
+    extents = torch.linalg.vector_norm(axes, dim=-1) / 2.0
+    unit_axes = axes / (2.0 * extents[..., None] + 1e-8)
+    relative = flat_points[:, :, None, :] - centers[:, None, :, :]
+    local = torch.einsum("bnmc,bmkc->bnmk", relative, unit_axes)
+    inside = (local.abs() <= extents[:, None, :, :] + 1e-6).all(dim=-1)
+    inside &= valid_boxes[:, None, :].bool()
+    return inside.reshape(*points.shape[:-1], boxes.shape[1])
+
+
+def construct_lidar_token_targets(lidar_points, lidar_point_valid, boxes, valid_boxes):
+    """Construct unique-instance token labels from all observed patch LiDAR points.
+
+    A token is foreground when its valid points hit exactly one tracked box,
+    background when it has valid points but hits no box, and ignored when it has
+    no LiDAR support or points associated with multiple boxes.
+    """
+    if lidar_points.shape[:-1] != lidar_point_valid.shape:
+        raise ValueError("LiDAR point and validity shapes are inconsistent")
+    point_hits = points_in_boxes_mask(lidar_points, boxes, valid_boxes)
+    point_hits &= lidar_point_valid[..., None]
+    box_hits = point_hits.any(dim=-2)
+    hit_count = box_hits.sum(dim=-1)
+    has_lidar = lidar_point_valid.any(dim=-1)
+    supervised = has_lidar & (hit_count <= 1)
+    labels = torch.zeros_like(hit_count, dtype=torch.long)
+    unique_foreground = hit_count == 1
+    labels[unique_foreground] = box_hits[unique_foreground].long().argmax(dim=-1) + 1
+    probabilities = F.one_hot(labels, num_classes=boxes.shape[1] + 1).to(lidar_points.dtype)
+    return probabilities.detach(), supervised.detach()
 
 
 def construct_assignment_targets(
@@ -231,8 +275,8 @@ def construct_assignment_targets(
     boxes,
     valid_boxes,
     mode,
-    lidar_anchors=None,
-    lidar_anchor_valid=None,
+    lidar_points=None,
+    lidar_point_valid=None,
     temperature=0.01,
 ):
     """Construct detached token-level object labels for assignment CE only."""
@@ -241,11 +285,12 @@ def construct_assignment_targets(
         supervised = torch.ones(
             points.shape[:-1], dtype=torch.bool, device=points.device
         )
-    elif mode == "lidar_anchor":
-        if lidar_anchors is None or lidar_anchor_valid is None:
-            raise ValueError("lidar_anchor mode requires anchors and validity")
-        points = lidar_anchors.detach()
-        supervised = lidar_anchor_valid.detach().bool()
+    elif mode in ("lidar_anchor", "lidar_token"):
+        if lidar_points is None or lidar_point_valid is None:
+            raise ValueError("lidar_anchor mode requires patch LiDAR points and validity")
+        return construct_lidar_token_targets(
+            lidar_points.detach(), lidar_point_valid.detach(), boxes, valid_boxes
+        )
     else:
         raise ValueError(f"unknown assignment GT mode: {mode}")
     probabilities = points_in_boxes_probability(
@@ -1259,17 +1304,17 @@ class UFO(ViT):
             t=t,
             v=v,
         )
-        if self.args.object_assignment_gt_mode == "lidar_anchor":
+        if self.args.object_assignment_gt_mode in ("lidar_anchor", "lidar_token"):
             if 'context_depth' not in data_dict:
                 raise RuntimeError("lidar_anchor assignment requires context_depth")
-            anchors, anchor_valid = build_lidar_token_anchors(
+            lidar_points, lidar_point_valid = build_lidar_token_points(
                 data_dict['context_depth'].to(data_dict['gs_dirs'].dtype),
                 data_dict['gs_origins'],
                 data_dict['gs_dirs'],
                 patch_size=self.unpatch_size,
             )
-            data_dict['assignment_anchor_means'] = anchors
-            data_dict['assignment_anchor_valid'] = anchor_valid
+            data_dict['assignment_lidar_points'] = lidar_points
+            data_dict['assignment_lidar_point_valid'] = lidar_point_valid
         return data_dict
 
 
@@ -1355,14 +1400,14 @@ class UFO(ViT):
         )
         t_means = rearrange(gs_params["means"], "b t v h w c -> b t (v h w) c")
         token_means = rearrange(data_dict['gs_token_means'], "b (t n) c -> b t n c", t=t)
-        lidar_anchors = None
-        lidar_anchor_valid = None
-        if self.args.object_assignment_gt_mode == "lidar_anchor":
-            lidar_anchors = rearrange(
-                data_dict['assignment_anchor_means'], "b (t n) c -> b t n c", t=t
+        lidar_points = None
+        lidar_point_valid = None
+        if self.args.object_assignment_gt_mode in ("lidar_anchor", "lidar_token"):
+            lidar_points = rearrange(
+                data_dict['assignment_lidar_points'], "b (t n) p c -> b t n p c", t=t
             )
-            lidar_anchor_valid = rearrange(
-                data_dict['assignment_anchor_valid'], "b (t n) -> b t n", t=t
+            lidar_point_valid = rearrange(
+                data_dict['assignment_lidar_point_valid'], "b (t n) p -> b t n p", t=t
             )
 
         with torch.no_grad():
@@ -1376,12 +1421,12 @@ class UFO(ViT):
                     data_dict['context_instances_corner'][:, _t],
                     data_dict['context_instances_id'][:, _t],
                     mode=self.args.object_assignment_gt_mode,
-                    lidar_anchors=(
-                        lidar_anchors[:, _t] if lidar_anchors is not None else None
+                    lidar_points=(
+                        lidar_points[:, _t] if lidar_points is not None else None
                     ),
-                    lidar_anchor_valid=(
-                        lidar_anchor_valid[:, _t]
-                        if lidar_anchor_valid is not None else None
+                    lidar_point_valid=(
+                        lidar_point_valid[:, _t]
+                        if lidar_point_valid is not None else None
                     ),
                     temperature=0.01,
                 )

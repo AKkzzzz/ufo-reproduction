@@ -145,3 +145,64 @@ does not justify foreground/background balanced CE because the learned assignmen
 remained healthy through warmup. Before a formal 100k switch, synchronize only
 after review and reproduce a short H200 continuation with the same anchor policy;
 do not fall back to predicted means for missing LiDAR anchors.
+
+## LiDAR-token and evaluator fixes
+
+The single averaged patch anchor was replaced by strict patch-level LiDAR-token
+supervision. Each 8x8 token retains all 64 pixel-aligned LiDAR observations, which
+are independently back-projected to world space and tested against valid tracked
+3D boxes:
+
+- points hit exactly one instance: supervise that foreground class;
+- valid points hit no instance: supervise background;
+- no valid LiDAR or points hit multiple instances: ignore the token;
+- object CE is evaluated only on the resulting valid-token mask.
+
+The formal mode is `lidar_token`. `lidar_anchor` remains only as a configuration
+compatibility alias, while `predicted_mean` is deprecated and retained solely for
+controlled public-v1 diagnostics. None of these observations enter the model,
+predicted Gaussian geometry, motion transform, or renderer.
+
+A real Waymo audit (scene index 13, start 27) found 170,785 valid LiDAR points,
+5,094 supervised tokens, and 685 unique foreground tokens (13.45%). Sixteen
+LiDAR-supported tokens were excluded relative to the old any-LiDAR mask because
+their instance assignment was ambiguous. Perturbing predicted means did not alter
+any LiDAR-token target.
+
+The evaluator was independently corrected to render and accumulate every recurrent
+chunk's targets. With `paper_frame_protocol=true`, every dataset-provided target is
+already a supervision frame and is evaluated directly; the old second `index % 5`
+filter is no longer applied. Dynamic masks use nearest-neighbor resizing, and the
+result records `dynamic_frame_count`, `dynamic_pixel_count`, and an explicit
+`NO_VALID_DYNAMIC_PIXELS` guard rather than silently dividing by zero.
+
+### Existing 5k checkpoints under the corrected evaluator
+
+No checkpoint was retrained. Both existing checkpoints were evaluated over the
+same 2,019 windows and 96,912 target-camera frames.
+
+| Metric | predicted_mean checkpoint | old averaged-anchor checkpoint | Delta anchor-control |
+|---|---:|---:|---:|
+| Full PSNR | 20.5341 | 19.3178 | -1.2163 dB |
+| Full SSIM | 0.5292 | 0.4960 | -0.0332 |
+| Depth RMSE | 12.3042 m | 11.5025 m | -0.8017 m |
+| Dynamic PSNR | 19.1121 | 18.6737 | -0.4384 dB |
+| Dynamic SSIM | 0.3018 | 0.2871 | -0.0147 |
+| Dynamic depth RMSE | 11.8693 m | 12.2587 m | +0.3894 m |
+| Dynamic frames | 50,111 | 50,111 | 0 |
+| Dynamic pixels | 130,524,387 | 130,524,387 | 0 |
+| Dynamic status | OK | OK | - |
+
+The corrected dynamic metrics are finite, but the old averaged-anchor checkpoint
+does not outperform the public-v1 control. This does not evaluate the new strict
+LiDAR-token labels: that checkpoint was trained before the all-point unique-box
+change. It establishes only that the evaluator is now usable and that the old
+averaged-anchor training run should not be promoted as evidence for the final GT
+policy. A future training comparison must start from identical initialization and
+train `lidar_token`; no loss balancing change is justified by this evaluation.
+
+Evaluation artifacts:
+
+- `outputs/dynamic_assignment_ab/predicted_mean_500/eval_fixed_engine.log`
+- `outputs/dynamic_assignment_ab/lidar_anchor_500/eval_fixed_engine.log`
+- each run's timestamped file under `eval_results/`

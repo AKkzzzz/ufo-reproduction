@@ -161,7 +161,7 @@ def points_in_boxes_probability(points, boxes, valid_mask, temperature=0.1, back
     # Points inside boxes (negative distance) get higher scores
     box_scores = -distance / temperature  # [B, N, M]
 
-    invalid_mask_expanded = ~valid_mask.bool().unsqueeze(1).expand(-1, N, -1)
+    invalid_mask_expanded = (1 - valid_mask.unsqueeze(1).expand(-1, N, -1)).type(torch.bool)
     box_scores = torch.where(invalid_mask_expanded, 
                                  torch.tensor(float('-inf'), device=device, dtype=box_scores.dtype),
                                  box_scores)
@@ -178,92 +178,6 @@ def points_in_boxes_probability(points, boxes, valid_mask, temperature=0.1, back
     probs = torch.softmax(all_scores, dim=2)  # [B, N, M+1]
     
     return probs
-
-
-def points_to_oriented_boxes_distance_per_box(points, boxes, valid_mask):
-    """Return each point's metric distance to every valid oriented box."""
-    centers = boxes.mean(dim=2)
-    edge_x = boxes[:, :, 1] - boxes[:, :, 0]
-    edge_y = boxes[:, :, 2] - boxes[:, :, 0]
-    edge_z = boxes[:, :, 4] - boxes[:, :, 0]
-    extents = torch.stack([
-        edge_x.norm(dim=-1), edge_y.norm(dim=-1), edge_z.norm(dim=-1)
-    ], dim=-1) / 2.0
-    axes = torch.stack([
-        F.normalize(edge_x, dim=-1),
-        F.normalize(edge_y, dim=-1),
-        F.normalize(edge_z, dim=-1),
-    ], dim=-2)
-    relative = points[:, :, None] - centers[:, None]
-    local = torch.einsum("bmij,bnmj->bnmi", axes, relative)
-    outside = (local.abs() - extents[:, None]).clamp_min(0)
-    distance = outside.norm(dim=-1)
-    return distance.masked_fill(~valid_mask.bool()[:, None], float("inf"))
-
-
-def points_to_oriented_boxes_distance(points, boxes, valid_mask):
-    """Return each point's metric distance to the nearest valid oriented box."""
-    return points_to_oriented_boxes_distance_per_box(
-        points, boxes, valid_mask
-    ).amin(dim=-1)
-
-
-def gaussian_bbox_geometry_gate(points, boxes, valid_mask, margin):
-    """Build a per-Gaussian gate that is one inside a bbox and decays outside."""
-    if margin < 0:
-        raise ValueError(f"geometry gate margin must be non-negative, got {margin}")
-    distance = points_to_oriented_boxes_distance_per_box(points, boxes, valid_mask)
-    if margin == 0:
-        gate = (distance <= 1e-6).to(points.dtype)
-    else:
-        gate = torch.exp(-distance / margin)
-    return gate.masked_fill(~valid_mask.bool()[:, None], 0.0)
-
-
-def gate_object_assignments(token_weights, geometry_gate):
-    """Gate object mass and return rejected mass to background."""
-    if token_weights.shape[:-1] != geometry_gate.shape[:-1]:
-        raise ValueError(
-            "token weights and geometry gate must describe the same Gaussians"
-        )
-    if token_weights.shape[-1] != geometry_gate.shape[-1] + 1:
-        raise ValueError("geometry gate must have one entry per non-background class")
-    gate = geometry_gate.to(token_weights).clamp(0.0, 1.0)
-    raw_objects = token_weights[..., 1:]
-    gated_objects = raw_objects * gate
-    gated_background = token_weights[..., :1] + (
-        raw_objects - gated_objects
-    ).sum(dim=-1, keepdim=True)
-    return torch.cat([gated_background, gated_objects], dim=-1)
-
-
-def gaussian_labels_to_token_labels(
-    gaussian_labels, views, height, width, patch_size, num_classes, threshold
-):
-    """Aggregate per-Gaussian hard labels into spatial token coverage labels."""
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError(f"coverage threshold must be in [0, 1], got {threshold}")
-    batch = gaussian_labels.shape[0]
-    expected = views * height * width
-    if gaussian_labels.shape[1] != expected:
-        raise ValueError(
-            f"expected {expected} Gaussian labels, got {gaussian_labels.shape[1]}"
-        )
-    one_hot = F.one_hot(gaussian_labels.long(), num_classes=num_classes).float()
-    coverage = rearrange(
-        one_hot, "b (v h w) k -> (b v) k h w", v=views, h=height, w=width
-    )
-    coverage = F.avg_pool2d(coverage, kernel_size=patch_size, stride=patch_size)
-    coverage = rearrange(
-        coverage, "(b v) k ph pw -> b (v ph pw) k", b=batch, v=views
-    )
-    max_object_coverage, object_index = coverage[..., 1:].max(dim=-1)
-    labels = torch.where(
-        max_object_coverage >= threshold,
-        object_index + 1,
-        torch.zeros_like(object_index),
-    )
-    return labels, max_object_coverage
 
 
 def expand_spatial_token_assignments(token_weights, views, height, width, patch_size=8):
@@ -1282,66 +1196,6 @@ class UFO(ViT):
             t=t,
             v=v,
         )
-        assignment_mode = getattr(self.args, "inference_assignment_mode", "predicted")
-        if assignment_mode != "predicted":
-            if self.training:
-                raise RuntimeError("inference assignment overrides cannot be used for training")
-            if assignment_mode != "oracle_bbox":
-                raise ValueError(f"unsupported inference_assignment_mode={assignment_mode!r}")
-            gaussian_means = rearrange(
-                gs_params["means"], "b t v h w c -> b t (v h w) c"
-            )
-            oracle_gaussian_weights = []
-            oracle_token_weights = []
-            token_means = rearrange(
-                data_dict['gs_token_means'], "b (t n) c -> b t n c", t=t
-            )
-            # The dataset fills an absent target object slot with an identity pose.
-            # Restrict the oracle to slots tracked throughout this render window so
-            # those placeholders cannot produce spurious world-origin motion.
-            target_valid_throughout = data_dict.get('oracle_target_valid_throughout')
-            if target_valid_throughout is None:
-                target_valid_throughout = data_dict['target_instances_id'].bool().all(dim=1)
-            oracle_valid_counts = []
-            with torch.no_grad():
-                for time_index in range(t):
-                    oracle_valid = (
-                        data_dict['context_instances_id'][:, time_index].bool()
-                        & target_valid_throughout
-                    )
-                    oracle_valid_counts.append(oracle_valid.sum(dim=-1))
-                    gaussian_prob = points_in_boxes_probability(
-                        gaussian_means[:, time_index].float(),
-                        data_dict['context_instances_corner_local'][:, time_index].float(),
-                        oracle_valid,
-                        temperature=0.01,
-                    )
-                    token_prob = points_in_boxes_probability(
-                        token_means[:, time_index].float(),
-                        data_dict['context_instances_corner_local'][:, time_index].float(),
-                        oracle_valid,
-                        temperature=0.01,
-                    )
-                    oracle_gaussian_weights.append(F.one_hot(
-                        gaussian_prob.argmax(dim=-1), num_classes=1 + self.num_bbox
-                    ).to(spatial_gaussian_weights.dtype))
-                    oracle_token_weights.append(F.one_hot(
-                        token_prob.argmax(dim=-1), num_classes=1 + self.num_bbox
-                    ).to(bbox_token_weights.dtype))
-            spatial_gaussian_weights = rearrange(
-                torch.stack(oracle_gaussian_weights, dim=1),
-                "b t (v h w) k -> b t v h w k", v=v, h=h, w=w,
-            )
-            bbox_token_weights = torch.stack(oracle_token_weights, dim=1)
-            flat_token_weights = bbox_token_weights.reshape(b, -1, 1 + self.num_bbox)
-            data_dict['bbox_token_weights'] = flat_token_weights
-            data_dict['bbox_weights'] = spatial_gaussian_weights
-            data_dict['oracle_gaussian_dynamic_ratio'] = (
-                spatial_gaussian_weights[..., 0] < 0.5
-            ).float().mean()
-            data_dict['oracle_stable_bbox_count'] = torch.stack(
-                oracle_valid_counts, dim=1
-            ).float().mean()
         if self.args.object_assignment_gt_mode == "lidar_anchor":
             if 'context_depth' not in data_dict:
                 raise RuntimeError("lidar_anchor assignment requires context_depth")
@@ -1457,152 +1311,13 @@ class UFO(ViT):
 
         with torch.no_grad():
             gt_prob = torch.zeros_like(token_probabilities)
-            gaussian_dynamic_ratios = []
-            gaussian_gt_labels = []
-            coverage_maxima = []
             for _t in range(t):
-                if self.args.object_assignment_gt_mode == "gaussian_coverage":
-                    gaussian_prob = points_in_boxes_probability(
-                        t_means[:, _t].detach(),
-                        data_dict['context_instances_corner'][:, _t],
-                        data_dict['context_instances_id'][:, _t],
-                        temperature=0.01,
-                    )
-                    gaussian_labels = gaussian_prob.argmax(dim=-1)
-                    gaussian_gt_labels.append(gaussian_labels)
-                    token_labels, max_coverage = gaussian_labels_to_token_labels(
-                        gaussian_labels,
-                        views=v,
-                        height=h,
-                        width=w,
-                        patch_size=self.unpatch_size,
-                        num_classes=1 + self.num_bbox,
-                        threshold=self.args.object_gaussian_coverage_threshold,
-                    )
-                    gt_prob[:, _t] = F.one_hot(
-                        token_labels, num_classes=1 + self.num_bbox
-                    ).to(gt_prob.dtype)
-                    gaussian_dynamic_ratios.append(
-                        (gaussian_labels > 0).float().mean()
-                    )
-                    coverage_maxima.append(max_coverage)
-                else:
-                    gt_prob[:, _t] = points_in_boxes_probability(
-                        assignment_means[:, _t].detach(),
-                        data_dict['context_instances_corner'][:, _t],
-                        data_dict['context_instances_id'][:, _t],
-                        temperature=0.01,
-                    )
-            if gaussian_dynamic_ratios:
-                data_dict['object_gaussian_dynamic_gt_ratio'] = torch.stack(
-                    gaussian_dynamic_ratios
-                ).mean()
-                data_dict['object_gaussian_coverage_max_mean'] = torch.cat(
-                    coverage_maxima, dim=1
-                ).mean()
-                gaussian_gt_labels = torch.stack(gaussian_gt_labels, dim=1)
-                gaussian_predictions = probabilities.argmax(dim=-1)
-                gaussian_dynamic_gt = gaussian_gt_labels > 0
-                gaussian_predicted_dynamic = gaussian_predictions > 0
-                data_dict['object_gaussian_predicted_dynamic_ratio'] = (
-                    gaussian_predicted_dynamic.float().mean()
+                gt_prob[:, _t] = points_in_boxes_probability(
+                    assignment_means[:, _t].detach(),
+                    data_dict['context_instances_corner'][:, _t],
+                    data_dict['context_instances_id'][:, _t],
+                    temperature=0.01,
                 )
-                if gaussian_dynamic_gt.any():
-                    data_dict['object_gaussian_foreground_recall'] = (
-                        gaussian_predictions[gaussian_dynamic_gt] > 0
-                    ).float().mean()
-                    data_dict['object_gaussian_dynamic_assignment_accuracy'] = (
-                        gaussian_predictions[gaussian_dynamic_gt]
-                        == gaussian_gt_labels[gaussian_dynamic_gt]
-                    ).float().mean()
-                if gaussian_predicted_dynamic.any():
-                    data_dict['object_gaussian_foreground_precision'] = (
-                        gaussian_gt_labels[gaussian_predicted_dynamic] > 0
-                    ).float().mean()
-
-            if getattr(self.args, "renderer_assignment_coordinate_diagnostics", False):
-                data_dict['renderer_coordinate_diagnostics_enabled'] = torch.ones(
-                    (), device=assignment_means.device
-                )
-                local_corners = data_dict.get('context_instances_corner_local')
-                if local_corners is not None:
-                    # input_dict retains only the current chunk's local boxes,
-                    # while scene-backed tensors contain all accumulated chunks.
-                    sample_t = min(t, local_corners.shape[1])
-                    sample_means = assignment_means[:, -sample_t:].detach().float()
-                    global_corners = data_dict['context_instances_corner'][:, -sample_t:].float()
-                    global_valid = data_dict['context_instances_id'][:, -sample_t:]
-                    local_corners = local_corners[:, -sample_t:].float()
-                    global_labels = []
-                    local_labels = []
-                    global_distances = []
-                    local_distances = []
-                    for diagnostic_t in range(sample_t):
-                        points = sample_means[:, diagnostic_t]
-                        valid = global_valid[:, diagnostic_t]
-                        global_labels.append(points_in_boxes_probability(
-                            points, global_corners[:, diagnostic_t], valid,
-                            temperature=0.01,
-                        ).argmax(dim=-1))
-                        local_labels.append(points_in_boxes_probability(
-                            points, local_corners[:, diagnostic_t], valid,
-                            temperature=0.01,
-                        ).argmax(dim=-1))
-                        global_distances.append(points_to_oriented_boxes_distance(
-                            points, global_corners[:, diagnostic_t], valid,
-                        ))
-                        local_distances.append(points_to_oriented_boxes_distance(
-                            points, local_corners[:, diagnostic_t], valid,
-                        ))
-                    global_labels = torch.stack(global_labels, dim=1)
-                    local_labels = torch.stack(local_labels, dim=1)
-                    global_distances = torch.stack(global_distances, dim=1)
-                    local_distances = torch.stack(local_distances, dim=1)
-                    gaussian_labels = []
-                    for diagnostic_t in range(sample_t):
-                        gaussian_labels.append(points_in_boxes_probability(
-                            t_means[:, -sample_t + diagnostic_t].detach().float(),
-                            global_corners[:, diagnostic_t],
-                            global_valid[:, diagnostic_t],
-                            temperature=0.01,
-                        ).argmax(dim=-1))
-                    gaussian_labels = torch.stack(gaussian_labels, dim=1)
-                    corner_center_delta = (
-                        global_corners.mean(dim=-2) - local_corners.mean(dim=-2)
-                    ).norm(dim=-1)
-                    data_dict['renderer_diag_token_count'] = torch.tensor(
-                        global_labels.numel(), device=global_labels.device
-                    )
-                    data_dict['renderer_global_dynamic_gt_count'] = (
-                        global_labels > 0
-                    ).sum()
-                    data_dict['renderer_local_dynamic_gt_count'] = (
-                        local_labels > 0
-                    ).sum()
-                    data_dict['renderer_global_gaussian_dynamic_gt_count'] = (
-                        gaussian_labels > 0
-                    ).sum()
-                    data_dict['renderer_global_gaussian_dynamic_gt_ratio'] = (
-                        gaussian_labels > 0
-                    ).float().mean()
-                    data_dict['renderer_global_nearest_bbox_distance_mean'] = (
-                        global_distances[torch.isfinite(global_distances)].mean()
-                    )
-                    data_dict['renderer_local_nearest_bbox_distance_mean'] = (
-                        local_distances[torch.isfinite(local_distances)].mean()
-                    )
-                    data_dict['renderer_global_nearest_bbox_distance_min'] = (
-                        global_distances.amin()
-                    )
-                    data_dict['renderer_local_nearest_bbox_distance_min'] = (
-                        local_distances.amin()
-                    )
-                    data_dict['renderer_global_local_bbox_center_delta_mean'] = (
-                        corner_center_delta[global_valid.bool()].mean()
-                    )
-                    data_dict['renderer_global_local_bbox_center_delta_max'] = (
-                        corner_center_delta[global_valid.bool()].max()
-                    )
 
         gt_soft_prob = gt_prob
         gt_prob = gt_soft_prob.argmax(dim=-1)
@@ -2117,106 +1832,6 @@ class UFO(ViT):
             data_dict = self.forward_motion_predictor_bbox(data_dict, gs_params)
         else:
             assert 'bbox_weights' in data_dict
-            if getattr(self.args, "inference_assignment_mode", "predicted") == "oracle_bbox":
-                b, t, v, h, w, _ = gs_params["means"].shape
-                gaussian_means = rearrange(
-                    gs_params["means"], "b t v h w c -> b t (v h w) c"
-                ).float()
-                token_means = rearrange(
-                    F.avg_pool2d(
-                        rearrange(
-                            gs_params["means"], "b t v h w c -> (b t v) c h w"
-                        ),
-                        kernel_size=self.unpatch_size,
-                        stride=self.unpatch_size,
-                    ),
-                    "(b t v) c ph pw -> b t (v ph pw) c",
-                    b=b,
-                    t=t,
-                    v=v,
-                ).float()
-                target_valid = data_dict.get('oracle_target_valid_throughout')
-                if target_valid is None:
-                    target_valid = data_dict['target_instances_id'].bool().all(dim=1)
-                gaussian_weights = []
-                token_weights = []
-                with torch.no_grad():
-                    for time_index in range(t):
-                        valid = (
-                            data_dict['context_instances_id'][:, time_index].bool()
-                            & target_valid
-                        )
-                        gaussian_prob = points_in_boxes_probability(
-                            gaussian_means[:, time_index],
-                            data_dict['context_instances_corner'][:, time_index].float(),
-                            valid,
-                            temperature=0.01,
-                        )
-                        token_prob = points_in_boxes_probability(
-                            token_means[:, time_index],
-                            data_dict['context_instances_corner'][:, time_index].float(),
-                            valid,
-                            temperature=0.01,
-                        )
-                        gaussian_weights.append(F.one_hot(
-                            gaussian_prob.argmax(dim=-1), num_classes=1 + self.num_bbox
-                        ).to(gs_params["means"].dtype))
-                        token_weights.append(F.one_hot(
-                            token_prob.argmax(dim=-1), num_classes=1 + self.num_bbox
-                        ).to(gs_params["means"].dtype))
-                data_dict['bbox_weights'] = rearrange(
-                    torch.stack(gaussian_weights, dim=1),
-                    "b t (v h w) k -> b t v h w k", v=v, h=h, w=w,
-                )
-                data_dict['bbox_token_weights'] = torch.stack(
-                    token_weights, dim=1
-                ).reshape(b, -1, 1 + self.num_bbox)
-            elif getattr(self.args, "object_assignment_geometry_gate", False):
-                b, t, v, h, w, _ = gs_params["means"].shape
-                token_weights = rearrange(
-                    data_dict['bbox_token_weights'], "b (t n) k -> b t n k", t=t
-                )
-                raw_weights = expand_spatial_token_assignments(
-                    token_weights, v, h, w, self.unpatch_size
-                )
-                gaussian_means = rearrange(
-                    gs_params["means"], "b t v h w c -> b t (v h w) c"
-                ).detach().float()
-                gated_weights = []
-                gate_support = []
-                with torch.no_grad():
-                    for time_index in range(t):
-                        geometry_gate = gaussian_bbox_geometry_gate(
-                            gaussian_means[:, time_index],
-                            data_dict['context_instances_corner'][:, time_index].float(),
-                            data_dict['context_instances_id'][:, time_index],
-                            margin=self.args.object_geometry_gate_margin,
-                        )
-                        gated_weights.append(gate_object_assignments(
-                            rearrange(
-                                raw_weights[:, time_index],
-                                "b v h w k -> b (v h w) k",
-                            ).float(),
-                            geometry_gate,
-                        ).to(raw_weights.dtype))
-                        gate_support.append(geometry_gate.amax(dim=-1) > 0.5)
-                gated_weights = rearrange(
-                    torch.stack(gated_weights, dim=1),
-                    "b t (v h w) k -> b t v h w k", v=v, h=h, w=w,
-                )
-                data_dict['object_raw_gaussian_dynamic_mass'] = (
-                    1.0 - raw_weights[..., 0].float()
-                ).mean()
-                data_dict['object_gated_gaussian_dynamic_mass'] = (
-                    1.0 - gated_weights[..., 0].float()
-                ).mean()
-                data_dict['object_gated_hard_dynamic_ratio'] = (
-                    gated_weights.argmax(dim=-1) > 0
-                ).float().mean()
-                data_dict['object_geometry_gate_support_ratio'] = torch.stack(
-                    gate_support, dim=1
-                ).float().mean()
-                data_dict['bbox_weights'] = gated_weights
 
         
         data_dict['gs_params'] = gs_params
@@ -2251,9 +1866,6 @@ class UFO(ViT):
                 chunk_data_dict["target_time"] = data_dict["target_time"][:, chunk_start:chunk_end]
                 chunk_data_dict["target_instances_pose"] = data_dict['target_instances_pose'][:, chunk_start:chunk_end]
                 chunk_render_results = self.forward_renderer(gs_params, chunk_data_dict)
-                for key, value in chunk_data_dict.items():
-                    if key.startswith("renderer_"):
-                        data_dict[key] = value
                 if chunk_start == 0:
                     render_results = chunk_render_results
                 else:

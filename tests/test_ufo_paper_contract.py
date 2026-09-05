@@ -4,12 +4,6 @@ from types import SimpleNamespace
 import torch
 
 from ufo.models.vit import Mlp
-from ufo.models.archs.small import (
-    gate_object_assignments,
-    gaussian_bbox_geometry_gate,
-    gaussian_labels_to_token_labels,
-    points_to_oriented_boxes_distance,
-)
 from ufo.paper_contract import (
     GAUSSIANS_PER_TOKEN,
     expand_token_assignments,
@@ -71,61 +65,6 @@ def test_scene_token_assignment_is_shared_by_64_gaussians():
     assert expanded.shape == (1, 128, 2)
     assert torch.equal(expanded[:, :64], token_weights[:, :1].expand(-1, 64, -1))
     assert torch.equal(expanded[:, 64:], token_weights[:, 1:].expand(-1, 64, -1))
-
-
-def test_oriented_box_distance_is_zero_inside_and_metric_outside():
-    box = torch.tensor([[[
-        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0],
-        [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
-        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0],
-        [-1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
-    ]]])
-    points = torch.tensor([[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]]])
-    distance = points_to_oriented_boxes_distance(
-        points, box, torch.tensor([[True]])
-    )
-    assert torch.allclose(distance, torch.tensor([[0.0, 2.0]]))
-
-
-def test_gaussian_coverage_requires_seven_of_64_for_ten_percent_threshold():
-    labels = torch.zeros(1, 8 * 8, dtype=torch.long)
-    labels[:, :6] = 2
-    token_labels, coverage = gaussian_labels_to_token_labels(
-        labels, views=1, height=8, width=8, patch_size=8,
-        num_classes=4, threshold=0.1,
-    )
-    assert token_labels.item() == 0
-    assert torch.isclose(coverage, torch.tensor([[6 / 64]])).all()
-
-    labels[:, 6] = 2
-    token_labels, coverage = gaussian_labels_to_token_labels(
-        labels, views=1, height=8, width=8, patch_size=8,
-        num_classes=4, threshold=0.1,
-    )
-    assert token_labels.item() == 2
-    assert torch.isclose(coverage, torch.tensor([[7 / 64]])).all()
-
-
-def test_geometry_gate_keeps_inside_mass_and_returns_outside_mass_to_background():
-    box = torch.tensor([[[
-        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0],
-        [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
-        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0],
-        [-1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
-    ]]])
-    points = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]])
-    gate = gaussian_bbox_geometry_gate(
-        points, box, torch.tensor([[True]]), margin=1.0
-    )
-    assert torch.allclose(gate[:, 0], torch.ones(1, 1))
-    assert torch.allclose(gate[:, 1], torch.tensor([[math.exp(-1.0)]]))
-
-    raw = torch.tensor([[[0.2, 0.8], [0.2, 0.8]]])
-    gated = gate_object_assignments(raw, gate)
-    assert torch.allclose(gated.sum(dim=-1), torch.ones(1, 2))
-    assert torch.allclose(gated[:, 0], raw[:, 0])
-    assert gated[0, 1, 0] > raw[0, 1, 0]
-    assert gated[0, 1, 1] < raw[0, 1, 1]
 
 
 def test_aux_outputs_are_split_from_recurrent_aux_sequence():

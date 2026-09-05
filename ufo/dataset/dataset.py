@@ -29,7 +29,6 @@ from tqdm import trange
 
 from .constants import DATASET_DICT, DATASETS, MEAN, STD
 from .data_utils import resize_depth, resize_flow, to_float_tensor, to_tensor
-from .pose_override import PoseOverrideStore
 from ufo.paper_contract import split_context_supervision
 
 logger = logging.getLogger("UFO")
@@ -126,43 +125,6 @@ class UFODataset(Dataset):
         self.load_dynamic_mask = load_dynamic_mask
         self.load_ground_label = load_ground_label
         self.skip_sky_mask = skip_sky_mask
-        self.pose_override_mode = getattr(args, "pose_override_mode", "none")
-        self.pose_free_camera_only = getattr(args, "pose_free_camera_only", False)
-        self.pose_free_coordinate_mode = getattr(
-            args, "pose_free_coordinate_mode", "identity"
-        )
-        pose_override_dir = getattr(args, "pose_override_dir", None)
-        if self.pose_override_mode not in ("none", "context", "all"):
-            raise ValueError(f"invalid pose_override_mode={self.pose_override_mode!r}")
-        if self.pose_override_mode != "none" and not pose_override_dir:
-            raise ValueError("pose_override_dir is required when pose_override_mode is enabled")
-        self.pose_override_store = (
-            PoseOverrideStore(pose_override_dir) if self.pose_override_mode != "none" else None
-        )
-        if self.pose_free_camera_only and self.pose_override_mode != "all":
-            raise ValueError("pose_free_camera_only requires pose_override_mode='all'")
-        if self.pose_free_coordinate_mode not in ("identity", "recurrent"):
-            raise ValueError(
-                f"invalid pose_free_coordinate_mode={self.pose_free_coordinate_mode!r}"
-            )
-        if self.pose_free_coordinate_mode != "identity" and not self.pose_free_camera_only:
-            raise ValueError(
-                "pose_free_coordinate_mode='recurrent' requires pose_free_camera_only"
-            )
-        self.intrinsics_override_mode = getattr(args, "intrinsics_override_mode", "none")
-        intrinsics_override_dir = getattr(args, "intrinsics_override_dir", None)
-        if self.intrinsics_override_mode not in ("none", "context", "all"):
-            raise ValueError(
-                f"invalid intrinsics_override_mode={self.intrinsics_override_mode!r}"
-            )
-        if self.intrinsics_override_mode != "none" and not intrinsics_override_dir:
-            raise ValueError(
-                "intrinsics_override_dir is required when intrinsics override is enabled"
-            )
-        self.intrinsics_override_store = (
-            PoseOverrideStore(intrinsics_override_dir)
-            if self.intrinsics_override_mode != "none" else None
-        )
         if isinstance(annotation_txt_file_list, str):
             annotation_txt_file_list = [annotation_txt_file_list]
         scene_list = []
@@ -196,51 +158,10 @@ class UFODataset(Dataset):
             ]
         )
 
-    def _camera_to_world(self, scene_json, camera, frame_idx, role):
-        if self.pose_free_camera_only:
-            pose = self.pose_override_store.get(scene_json["scene_name"], frame_idx, camera)
-            frame = self.pose_override_store.coordinate_frame(scene_json["scene_name"])
-            if frame != "rig_local_metric":
-                raise ValueError(
-                    "pose_free_camera_only requires a rig_local_metric override, "
-                    f"got {frame!r}"
-                )
-            return pose
-        use_override = self.pose_override_store is not None and (
-            role == "context" or (role == "target" and self.pose_override_mode == "all")
-        )
-        if use_override:
-            return self.pose_override_store.get(
-                scene_json["scene_name"], frame_idx, camera
-            )
-        return np.asarray(scene_json["camera_to_world"][camera][frame_idx], dtype=np.float64)
-
-    def _camera_intrinsics(self, scene_json, camera, frame_idx, role):
-        use_override = self.intrinsics_override_store is not None and (
-            role == "context" or (role == "target" and self.intrinsics_override_mode == "all")
-        )
-        if use_override:
-            return self.intrinsics_override_store.get_intrinsics(
-                scene_json["scene_name"], frame_idx, camera
-            )
-        fx, fy, cx, cy = np.asarray(scene_json["normalized_intrinsics"][camera])
-        return np.asarray([
-            [fx * self.target_size[1], 0.0, cx * self.target_size[1]],
-            [0.0, fy * self.target_size[0], cy * self.target_size[0]],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-
     def __len__(self) -> int:
         return len(self.annotations)
 
     def _with_instances(self, scene_json):
-        if self.pose_free_camera_only:
-            scene_json = scene_json.copy()
-            scene_json["instances_info"] = {}
-            scene_json["frame_instances"] = {
-                str(frame): [] for frame in range(scene_json["num_timesteps"])
-            }
-            return scene_json
         if "instances_info" in scene_json and "frame_instances" in scene_json:
             return scene_json
         cache_key = scene_json["scene_name"]
@@ -304,11 +225,12 @@ class UFODataset(Dataset):
         frame_idx: int,
         source_frame_idx: int = -1,
         global_source_frame_idx: int = -1,
-        available_instances = None,
-        pose_role: str = "context",
+        available_instances = None
     ) -> Dict[str, Any]:
         """Retrieve a single frame from the dataset."""
+        normalized_intrinsics = scene_json["normalized_intrinsics"]
         dataset_name = scene_json["dataset"]
+        cam_to_world = scene_json["camera_to_world"]
 
         images, depths, sky_masks, flows = [], [], [], []
         camtoworlds, intrinsics = [], []
@@ -324,28 +246,13 @@ class UFODataset(Dataset):
         camera_list = DATASET_DICT[dataset_name]["camera_list"][self.num_max_cams]
         ref_camera_name = DATASET_DICT[dataset_name]["ref_camera"]
 
-        if self.pose_free_camera_only and self.pose_free_coordinate_mode == "identity":
-            # Legacy P2 diagnostic. Kept only so the published P2 result remains
-            # reproducible; recurrent pose-free runs must use the branch below.
-            world_to_canonical = np.eye(4, dtype=np.float64)
-            world_to_canonical_global = np.eye(4, dtype=np.float64)
-        else:
-            # In P2.1 both references come from the same rig-local Omega override.
-            # This preserves UFO's current-chunk/local versus persistent/global
-            # coordinate contract without consulting a GT camera trajectory.
-            c2w_real_cur_frame = self._camera_to_world(
-                scene_json, ref_camera_name, source_frame_idx, "context"
-            )
-            c2w_real_global = self._camera_to_world(
-                scene_json, ref_camera_name, global_source_frame_idx, "global"
-            )
-            world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
-            world_to_canonical_global = np.linalg.inv(c2w_real_global)
+        c2w_real_cur_frame = np.array(cam_to_world[ref_camera_name][source_frame_idx])
+        c2w_real_global = np.array(cam_to_world[ref_camera_name][global_source_frame_idx])
+
+        world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
+        world_to_canonical_global = np.linalg.inv(c2w_real_global)
 
         for camera in camera_list:
-            frame_camera_to_world = self._camera_to_world(
-                scene_json, camera, frame_idx, pose_role
-            )
             img_relative_path = scene_json["relative_image_path"][camera][frame_idx]
             if dataset_name in ["waymo", "nuscenes", "argoverse2", "argoverse"]:
                 img_relative_path = img_relative_path.replace("images", f"images_4")
@@ -399,7 +306,7 @@ class UFODataset(Dataset):
             camtoworld = (
                 DATASETS[dataset_name]["canonical_to_flu"]
                 @ world_to_canonical
-                @ frame_camera_to_world
+                @ cam_to_world[camera][frame_idx]
                 @ DATASETS[dataset_name]["opencv2dataset"]
             )
 
@@ -409,16 +316,27 @@ class UFODataset(Dataset):
             camtoworld_global = (
                 DATASETS[dataset_name]["canonical_to_flu"]
                 @ world_to_canonical_global
-                @ frame_camera_to_world
+                @ cam_to_world[camera][frame_idx]
                 @ DATASETS[dataset_name]['opencv2dataset']
             )
             camtoworld_global = to_tensor(camtoworld_global)
             camtoworlds_global.append(camtoworld_global)
 
             # intrinsics
-            intrinsics.append(torch.tensor(self._camera_intrinsics(
-                scene_json, camera, frame_idx, pose_role
-            )).float())
+            fx, fy, cx, cy = np.array(normalized_intrinsics[camera])
+            fx = fx * self.target_size[1]
+            fy = fy * self.target_size[0]
+            cx = cx * self.target_size[1]
+            cy = cy * self.target_size[0]
+            intrinsics.append(
+                torch.tensor(
+                    [
+                        [fx, 0.0, cx],
+                        [0.0, fy, cy],
+                        [0.0, 0.0, 1.0],
+                    ]
+                ).float()
+            )
 
             if self.load_depth or self.load_flow:
                 if dataset_name == "waymo":
@@ -441,7 +359,7 @@ class UFODataset(Dataset):
                             @ torch.tensor(
                                 (
                                     world_to_canonical
-                                    @ frame_camera_to_world
+                                    @ cam_to_world[camera][frame_idx]
                                     @ np.linalg.inv(scene_json["camera_to_ego"][camera])
                                 )
                             )
@@ -589,34 +507,13 @@ class UFODataset(Dataset):
                 initial_start_frame = context_frame_idx
                 
             # Validate and adjust if necessary
-            if initial_start_frame + num_max_future_frames > num_timesteps:
+            if initial_start_frame + num_max_future_frames >= num_timesteps:
                 initial_start_frame = np.random.randint(0, max(1, num_timesteps - num_max_future_frames))
             
             value_list = []
             
             first_context_idx = None
             last_frame_idx = initial_start_frame + num_max_future_frames
-            global_reference_frame_idx = min(last_frame_idx, num_timesteps - 1)
-            if (
-                self.pose_free_camera_only
-                and self.pose_free_coordinate_mode == "recurrent"
-            ):
-                override_frames = self.pose_override_store.frame_ids(
-                    scene_json["scene_name"]
-                )
-                if not override_frames:
-                    raise ValueError("pose-free override contains no frames")
-                global_reference_frame_idx = override_frames[-1]
-                if not (
-                    initial_start_frame
-                    <= global_reference_frame_idx
-                    < last_frame_idx
-                ):
-                    raise ValueError(
-                        "pose-free global reference must lie inside the current "
-                        f"window [{initial_start_frame}, {last_frame_idx}); got "
-                        f"{global_reference_frame_idx}"
-                    )
 
             # get all possible instances
             frame_instances = scene_json['frame_instances']
@@ -692,9 +589,7 @@ class UFODataset(Dataset):
 
                 reverse = self.reverse
                 # Generate target frame indices for this window
-                if getattr(self.args, "full_window_targets", False):
-                    target_frame_idx = np.arange(window_start, window_end)
-                elif getattr(self.args, "paper_frame_protocol", False):
+                if getattr(self.args, "paper_frame_protocol", False):
                     # The paper fixes the frame partition but does not disclose
                     # whether training renders these frames per chunk or from S_T.
                     target_frame_idx = np.asarray(frame_protocol.supervision)
@@ -762,15 +657,14 @@ class UFODataset(Dataset):
                         scene_json=scene_json,
                         frame_idx=ctx_id,
                         source_frame_idx=window_context_indices[0],
-                        global_source_frame_idx=global_reference_frame_idx,
-                        available_instances=available_instances,
-                        pose_role="context",
+                        global_source_frame_idx=last_frame_idx,
+                        available_instances=available_instances
                     )
                     if self.static:
                         if context_dict['flow'].abs().mean() - 0 > 1e-5:
                             return self.__getitem__(index + 1, context_frame_idx, return_all)
                     context_dict["time"] = torch.tensor(
-                        [time_in_seconds[ctx_id] - time_in_seconds[global_reference_frame_idx]]
+                        [time_in_seconds[ctx_id] - time_in_seconds[last_frame_idx]]
                         * self.num_max_cams
                     )
                     context_dict_list.append(context_dict)
@@ -785,12 +679,11 @@ class UFODataset(Dataset):
                         scene_json=scene_json,
                         frame_idx=target_id,
                         source_frame_idx=window_context_indices[0],
-                        global_source_frame_idx=global_reference_frame_idx,
-                        available_instances=available_instances,
-                        pose_role="target",
+                        global_source_frame_idx=last_frame_idx,
+                        available_instances=available_instances
                     )
                     target_dict["time"] = torch.tensor(
-                        [time_in_seconds[target_id] - time_in_seconds[global_reference_frame_idx]]
+                        [time_in_seconds[target_id] - time_in_seconds[last_frame_idx]]
                         * self.num_max_cams
                     )
                     target_dict_list.append(target_dict)

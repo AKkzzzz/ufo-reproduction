@@ -1,0 +1,26 @@
+H200 runnable snapshot: 2026-09-05
+
+===== Git =====
+branch: h200-runnable-snapshot-20260905
+base_head: 234a66941c33bd3b3eab7a47b62d4f2364f15092
+
+===== Python =====
+Python 3.10.19
+
+===== Torch =====
+torch: 2.10.0+cu128
+cuda: 12.8
+bf16: True
+
+===== Known-working H200 launch =====
+. /root/miniconda3/etc/profile.d/conda.sh && \
+conda activate dggt_data && \
+cd /inspire/hdd/global_user/guoluosong-253108120129/yx-ufo && \
+export UFO_PYTHON_BIN=/root/miniconda3/envs/dggt_data/bin/python && \
+export UFO_TORCHRUN_BIN=/root/miniconda3/envs/dggt_data/bin/torchrun && \
+export UFO_DATA_ROOT="$PWD/data/UFO_paper" && \
+export UFO_OUTPUT_ROOT="$PWD/outputs" && \
+bash scripts/h200/run_ufo_h200.sh \
+  --task 2s \
+  --mode d50 \
+  --resume "$PWD/outputs/h200_reproduction/ufo_h200_2s_d50_global64/checkpoints/ckpt_006499.pth"

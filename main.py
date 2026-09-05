@@ -311,18 +311,9 @@ def get_args_parser():
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
     parser.add_argument(
         "--object_assignment_gt_mode",
-        choices=["predicted_mean", "lidar_anchor", "gaussian_coverage"],
+        choices=["predicted_mean", "lidar_anchor"],
         default="predicted_mean",
-        help="Select the geometry used to construct token-level object labels.",
-    )
-    parser.add_argument("--object_gaussian_coverage_threshold", type=float, default=0.1)
-    parser.add_argument(
-        "--object_assignment_geometry_gate", action="store_true",
-        help="Gate broadcast token ownership using current Gaussian-to-bbox geometry.",
-    )
-    parser.add_argument(
-        "--object_geometry_gate_margin", type=float, default=0.5,
-        help="Metric falloff margin outside each oriented bbox; zero gives a hard inside gate.",
+        help="Public-v1 predicted mean or reproduction-decision LiDAR token anchor supervision.",
     )
     parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
     parser.add_argument("--dynamic_rich_pool", type=str, default=None)
@@ -378,11 +369,6 @@ def get_args_parser():
                         help="Load preprocessed dynamic masks for dynamic-region diagnostics.")
     parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
     parser.add_argument("--subset_ratio", default=1.0, type=float)
-    parser.add_argument(
-        "--train_scene_indices", default=None,
-        help="Comma-separated indices into the training annotation list.",
-    )
-    parser.add_argument("--disable_validation", action="store_true")
     parser.add_argument("--num_workers", default=16, type=int)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--non_blocking_h2d", action="store_true")
@@ -479,14 +465,28 @@ def _sha256(path):
 
 def save_run_manifest(args, world_size, train_annotation, val_annotation):
     def git(*command):
-        return subprocess.check_output(["git", *command], text=True).strip()
+        try:
+            return subprocess.check_output(
+                ["git", *command],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return "UNAVAILABLE"
 
     tracked_inputs = {
         "train_scene_list": train_annotation,
         "validation_scene_list": val_annotation,
         "instance_scene_manifest": args.instance_scene_index_manifest,
     }
-    git_diff = subprocess.check_output(["git", "diff", "--binary"], text=False)
+
+    try:
+        git_diff = subprocess.check_output(
+            ["git", "diff", "--binary"],
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        git_diff = b""
     manifest = {
         "command": [sys.executable, *sys.argv],
         "git_commit": git("rev-parse", "HEAD"),
@@ -606,14 +606,6 @@ def main(args):
     dataset_meta = DATASET_DICT[args.dataset]
     train_annotation = dataset_meta["annotation_txt_file_train"]
     val_annotation = dataset_meta["annotation_txt_file_val"]
-    train_scene_indices = None
-    if args.train_scene_indices:
-        if isinstance(args.train_scene_indices, str):
-            train_scene_indices = [
-                int(value) for value in args.train_scene_indices.split(",") if value.strip()
-            ]
-        else:
-            train_scene_indices = [int(value) for value in args.train_scene_indices]
     if train_annotation is not None:
         if args.dataset == "nuscenes":
             train_annotation = f"data/dataset_scene_list/nuscenes_train.txt"
@@ -626,13 +618,10 @@ def main(args):
             val_annotation = f"{args.data_root}/{val_annotation}"
         if not os.path.exists(val_annotation):
             val_annotation = None
-    if args.disable_validation:
-        val_annotation = None
 
     dataset_train = UFODataset(
         data_root=args.data_root,
         annotation_txt_file_list=train_annotation,
-        subset_indices=train_scene_indices,
         target_size=args.input_size,
         num_context_timesteps=args.num_context_timesteps,
         num_target_timesteps=args.num_target_timesteps,

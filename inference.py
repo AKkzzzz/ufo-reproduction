@@ -78,28 +78,6 @@ def get_args_parser():
                         help="Enable debug mode: save filtering PCD point clouds")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device for inference")
-    parser.add_argument("--annotation_file", type=str, default=None,
-                        help="Explicit annotation list; defaults to the dataset validation list")
-    parser.add_argument("--pose_override_dir", type=str, default=None,
-                        help="Root containing <scene_name>/omega_pose_override.npz")
-    parser.add_argument("--pose_override_mode", choices=("none", "context", "all"),
-                        default="none")
-    parser.add_argument("--intrinsics_override_dir", type=str, default=None,
-                        help="Root containing Omega intrinsics in the pose override NPZ")
-    parser.add_argument("--intrinsics_override_mode", choices=("none", "context", "all"),
-                        default="none")
-    parser.add_argument("--pose_free_camera_only", action="store_true",
-                        help="Use rig-local camera overrides and disable GT-world object poses")
-    parser.add_argument(
-        "--pose_free_coordinate_mode", choices=("identity", "recurrent"),
-        default="identity",
-        help="Use legacy shared coordinates or restore UFO local/global canonicalization",
-    )
-    parser.add_argument(
-        "--inference_assignment_mode", choices=("predicted", "oracle_bbox"),
-        default="predicted",
-        help="Use predicted assignment or a hard GT-box oracle during eval",
-    )
 
     # Model parameters (defaults from config.json, CLI overrides)
     parser.add_argument("--model", default="UFO-B/8", type=str)
@@ -138,35 +116,12 @@ def get_args_parser():
     return parser
 
 
-def add_missing_config_values(args, config_path):
-    """Retain config-only model and dataset fields absent from this CLI parser."""
-    config = json.loads(Path(config_path).read_text())
-    for key, value in config.items():
-        if not hasattr(args, key):
-            setattr(args, key, value)
-    return args
-
-
-def add_missing_checkpoint_values(args, checkpoint):
-    """Fill parser gaps from the exact Namespace persisted during training."""
-    checkpoint_args = checkpoint.get("args")
-    if checkpoint_args is None:
-        return args
-    values = vars(checkpoint_args) if hasattr(checkpoint_args, "__dict__") else checkpoint_args
-    for key, value in values.items():
-        if not hasattr(args, key):
-            setattr(args, key, value)
-    return args
-
-
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
 def build_model(args, device):
     """Create and load a UFO model from checkpoint."""
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    add_missing_checkpoint_values(args, checkpoint)
     model = UFO_models[args.model](
         img_size=args.input_size,
         gs_dim=args.gs_dim,
@@ -181,6 +136,7 @@ def build_model(args, device):
         args=args,
     )
 
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"]
     msg = model.load_state_dict(state_dict, strict=False)
     if msg.missing_keys:
@@ -200,8 +156,8 @@ def build_model(args, device):
 def build_dataset(args):
     """Create evaluation dataset."""
     dataset_meta = DATASET_DICT[args.dataset]
-    val_annotation = args.annotation_file or dataset_meta["annotation_txt_file_val"]
-    if val_annotation is not None and not args.annotation_file:
+    val_annotation = dataset_meta["annotation_txt_file_val"]
+    if val_annotation is not None:
         val_annotation = f"{args.data_root}/{val_annotation}"
         if not os.path.exists(val_annotation):
             raise FileNotFoundError(f"Annotation file not found: {val_annotation}")
@@ -209,7 +165,6 @@ def build_dataset(args):
     dataset = UFODataset(
         data_root=args.data_root,
         annotation_txt_file_list=val_annotation,
-        subset_indices=[args.scene_id] if args.annotation_file else None,
         target_size=args.input_size,
         equispaced=True,
         num_context_timesteps=args.num_context_timesteps,
@@ -218,8 +173,6 @@ def build_dataset(args):
         num_max_cams=args.num_max_cameras,
         load_depth=args.load_depth,
         load_flow=args.load_flow,
-        load_dynamic_mask=getattr(args, "load_dynamic_mask", False),
-        load_ground_label=getattr(args, "load_ground", False),
         skip_sky_mask=args.skip_sky_mask,
         num_target_chunks=args.num_target_chunks,
         static=args.static,
@@ -234,25 +187,6 @@ def build_dataset(args):
 # Inference
 # ---------------------------------------------------------------------------
 
-def concatenate_chunk_targets(inout_dicts):
-    """Combine every chunk's render inputs and GT along the target-time axis."""
-    if not inout_dicts:
-        raise ValueError("cannot concatenate targets from an empty chunk list")
-    render_input = inout_dicts[-1][0].copy()
-    target_keys = [
-        key for key in render_input
-        if key.startswith("target_") and isinstance(render_input[key], torch.Tensor)
-    ]
-    for key in target_keys:
-        values = [input_dict[key] for input_dict, _ in inout_dicts]
-        render_input[key] = torch.cat(values, dim=1)
-
-    target_dict = {}
-    for key in inout_dicts[0][1]:
-        values = [chunk_target[key] for _, chunk_target in inout_dicts]
-        target_dict[key] = torch.cat(values, dim=1)
-    return render_input, target_dict
-
 @torch.no_grad()
 def run_inference(model, dataset, args, device):
     """Run autoregressive inference on a single scene.
@@ -263,27 +197,22 @@ def run_inference(model, dataset, args, device):
         input_dict: input data for the last chunk (with accumulated scene)
         data_dict: raw data dict (contains fps, scene_name, etc.)
     """
-    dataset_index = 0 if args.annotation_file else args.scene_id
-    data_dict = dataset.__getitem__(dataset_index, args.start_idx, return_all=True)
+    data_dict = dataset.__getitem__(args.scene_id, args.start_idx, return_all=True)
     data_dict = to_batch_tensor(data_dict)
 
     inout_dicts = prepare_inputs_and_targets(
         data_dict, device, timespan=args.timespan, from_list=True, args=args
     )
-    if getattr(args, "inference_assignment_mode", "predicted") == "oracle_bbox":
-        full_target_valid = torch.cat(
-            [input_dict["target_instances_id"] for input_dict, _ in inout_dicts],
-            dim=1,
-        ).bool().all(dim=1)
-        for input_dict, _ in inout_dicts:
-            input_dict["oracle_target_valid_throughout"] = full_target_valid
     num_chunks = len(inout_dicts)
     logger.info(f"Scene {args.scene_id} (start_idx={args.start_idx}): {num_chunks} chunks")
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         scene = {}
+        target_dict_list = []
+
         for i in range(num_chunks):
             input_dict, target_dict = inout_dicts[i]
+            target_dict_list.append(target_dict)
 
             t0 = time.perf_counter()
             log_dir = ""
@@ -299,12 +228,8 @@ def run_inference(model, dataset, args, device):
             n_tokens = scene["gs_state"].shape[1] if "gs_state" in scene else 0
             logger.info(f"  Chunk {i + 1}/{num_chunks}: {n_tokens} tokens ({elapsed:.3f}s)")
 
-        # Render all target frames against the final accumulated scene.
-        input_dict, target_dict = concatenate_chunk_targets(inout_dicts)
-        logger.info(
-            "Rendering final scene at %d target timesteps...",
-            target_dict["target_image"].shape[1],
-        )
+        # Final rendering with accumulated scene
+        logger.info("Rendering final scene...")
         input_dict.update(scene)
         input_dict = model(input_dict, stage=2, motion=False)
         pred_dict = model(input_dict, stage=3)
@@ -372,7 +297,6 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
         "psnr": [], "ssim": [],
         "occupied_psnr": [], "occupied_ssim": [],
         "dynamic_psnr": [], "dynamic_ssim": [],
-        "static_psnr": [], "static_ssim": [],
         "depth_rmse": [], "dynamic_depth_rmse": [],
     }
 
@@ -397,8 +321,6 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
         ssim_val = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1)
         metrics["ssim"].append(float(ssim_val))
 
-        ssim_map = None
-
         # Occupied PSNR/SSIM
         occ = occ_flat[idx]
         if occ.any():
@@ -406,29 +328,18 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
             gt_occ = rearrange(gt_flat[idx], "h w c -> c h w")[:, occ]
             mse_occ = F.mse_loss(pr_occ, gt_occ).item()
             metrics["occupied_psnr"].append(-10.0 * np.log10(max(mse_occ, 1e-12)))
-            ssim_map = ssim(
-                pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True
-            )[1]
+            ssim_map = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True)[1]
             occ_np = occ.cpu().numpy()
             metrics["occupied_ssim"].append(float(ssim_map[occ_np].mean()))
 
         # Dynamic PSNR/SSIM
         dm = dyn_flat[idx]
-        sm = ~dm
-        if sm.any():
-            pr_static = rearrange(pr_flat[idx], "h w c -> c h w")[:, sm]
-            gt_static = rearrange(gt_flat[idx], "h w c -> c h w")[:, sm]
-            mse_static = F.mse_loss(pr_static, gt_static).item()
-            metrics["static_psnr"].append(-10.0 * np.log10(max(mse_static, 1e-12)))
-            if ssim_map is None:
-                ssim_map = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True)[1]
-            metrics["static_ssim"].append(float(ssim_map[sm.cpu().numpy()].mean()))
         if dm.any():
             pr_dyn = rearrange(pr_flat[idx], "h w c -> c h w")[:, dm]
             gt_dyn = rearrange(gt_flat[idx], "h w c -> c h w")[:, dm]
             mse_dyn = F.mse_loss(pr_dyn, gt_dyn).item()
             metrics["dynamic_psnr"].append(-10.0 * np.log10(max(mse_dyn, 1e-12)))
-            if ssim_map is None:
+            if "ssim_map" not in dir():
                 ssim_map = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True)[1]
             dyn_np = dm.cpu().numpy()
             metrics["dynamic_ssim"].append(float(ssim_map[dyn_np].mean()))
@@ -515,7 +426,6 @@ def main():
     # Re-parse with the config file specified
     config_path = args.config
     args = merge_config_and_args(parser, config_path=config_path)
-    args = add_missing_config_values(args, config_path)
 
     device = torch.device(args.device)
     logger.info(f"Config: {config_path}")

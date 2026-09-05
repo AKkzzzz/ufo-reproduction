@@ -164,7 +164,10 @@ for line in (root / "results.tsv").read_text().splitlines():
     peak = float(fields[4])
     batch = int(tag.split("_")[0][1:])
     accum = int(tag.split("_")[1][1:])
-    optimizer_step = compute * accum
+    # main.py records compute_step_start on accumulation_index == 0 and
+    # compute_step_end only after should_step and optimizer.step(). Therefore
+    # this value already spans the complete global-64 optimizer cycle.
+    optimizer_step = compute
 
     valid.append((optimizer_step, peak, tag, compute))
     records.append({

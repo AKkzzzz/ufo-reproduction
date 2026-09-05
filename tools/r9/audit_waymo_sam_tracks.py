@@ -127,6 +127,11 @@ def audit_pair(scene, camera, indices, output_root):
             if np.any(mask < 0):
                 errors.append(f"{path.name}: negative instance ID")
                 continue
+            if int(mask.max()) >= 10000:
+                errors.append(
+                    f"{path.name}: local instance ID must be <10000, got {int(mask.max())}"
+                )
+                continue
             if not np.any(mask == 0):
                 errors.append(f"{path.name}: background 0 missing")
         except Exception as error:

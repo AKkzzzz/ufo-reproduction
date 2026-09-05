@@ -530,8 +530,15 @@ def backup_python_files(backup_dir):
 
     # Find all Python files recursively
     for root, dirs, files in os.walk(root_dir):
-        # Skip backup directory itself, hidden directories, data directory, and output
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d != os.path.basename(backup_dir) and d != 'data' and d != 'output']
+        # Runtime environments, datasets, and prior runs are not source code.
+        skipped = {
+            os.path.basename(backup_dir),
+            "data",
+            "output",
+            "outputs",
+            "third_party",
+        }
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skipped]
 
         for file in files:
             if file.endswith('.py'):

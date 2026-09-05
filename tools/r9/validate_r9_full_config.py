@@ -13,6 +13,7 @@ EXPECTED = {
     "dynamic_renderer_mode": "sam_object_fusion",
     "sam_canonical_fusion_impl": "feature_fusion",
     "num_iterations": 100000,
+    "batch_size": 8,
     "warmup_iters": 5000,
     "lr": 1e-4,
     "min_lr": 1e-6,

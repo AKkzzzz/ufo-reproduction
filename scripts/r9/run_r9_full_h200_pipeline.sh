@@ -14,6 +14,7 @@ DGGT_PYTHON="/root/miniconda3/envs/dggt_data/bin/python"
 DGGT_TORCHRUN="/root/miniconda3/envs/dggt_data/bin/torchrun"
 FULL_CONFIG="${REPO_ROOT}/configs/h200/ufo_r9_waymo_full_global64.json"
 PROFILE="${REPO_ROOT}/outputs/h200_r9_profile/recommended.env"
+DYNAMIC_POOL="${REPO_ROOT}/offline_assets/data_contract/dynamic_rich_pool.json"
 
 echo "STEP 0: preflight"
 mkdir -p "${SAM_ROOT}"
@@ -30,6 +31,7 @@ for path in \
   "${CHECKPOINT}" \
   "${DGGT_PYTHON}" \
   "${DGGT_TORCHRUN}" \
+  "${DYNAMIC_POOL}" \
   "${FULL_CONFIG}" \
   "${REPO_ROOT}/main.py" \
   "${REPO_ROOT}/scripts/r9/run_waymo_sam2_tracks_h200_8gpu.sh" \
@@ -46,13 +48,19 @@ test -n "${grounding_weights}" -a -s "${grounding_weights}" || {
   exit 1
 }
 "${GSAM_PYTHON}" tools/r9/validate_r9_full_config.py "${FULL_CONFIG}"
+"${GSAM_PYTHON}" tools/r9/validate_groundedsam_runtime.py
+"${DGGT_PYTHON}" tools/r9/validate_dynamic_rich_pool.py \
+  --pool "${DYNAMIC_POOL}"
 
 if [[ "${R9_PIPELINE_DRY_RUN:-0}" == "1" ]]; then
   echo "DRY RUN: GPU count check bypassed; no model, preprocessing, benchmark, or training will run."
+  echo "STEP 0A command: bash scripts/h200/bootstrap_h200_offline.sh"
+  echo "STEP 0B command: bash scripts/h200/smoke_h200_ddp.sh"
   echo "STEP 1 command: bash scripts/r9/run_waymo_sam2_tracks_h200_8gpu.sh"
   R9_SAM_DRY_RUN=1 bash scripts/r9/run_waymo_sam2_tracks_h200_8gpu.sh
   echo "STEP 2 command: ${GSAM_PYTHON} tools/r9/audit_waymo_sam_tracks.py --require-full"
   echo "STEP 3 command: ${DGGT_PYTHON} tools/r9/check_sam_track_contract.py --num-scenes 8"
+  echo "STEP 3B command: ${DGGT_PYTHON} tools/r9/check_r9_training_input_contract.py"
   echo "STEP 4 command: bash scripts/h200/benchmark_r9_h200.sh"
   echo "STEP 5 profile: ${PROFILE}"
   echo "STEP 6: print selected 8xH200 global-batch-64 configuration"
@@ -72,14 +80,21 @@ if ! grep -qi 'H200' <<<"${gpu_models}"; then
   echo "WARNING: GPU names do not contain H200; continuing after printing detected models." >&2
 fi
 
+export UFO_PYTHON_BIN="${DGGT_PYTHON}"
+export UFO_TORCHRUN_BIN="${DGGT_TORCHRUN}"
+source scripts/h200/env_h200_offline.sh
+
+echo "STEP 0A: H200 offline runtime bootstrap"
+bash scripts/h200/bootstrap_h200_offline.sh
+
+echo "STEP 0B: 8-GPU H200 DDP smoke"
+bash scripts/h200/smoke_h200_ddp.sh
+
 export HF_HOME="${HF_CACHE}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTHONNOUSERSITE=1
 "${GSAM_PYTHON}" -c 'import torch, transformers, sam2, numpy, PIL, supervision'
-export UFO_PYTHON_BIN="${DGGT_PYTHON}"
-export UFO_TORCHRUN_BIN="${DGGT_TORCHRUN}"
-source scripts/h200/env_h200_offline.sh
 "${UFO_PYTHON_BIN}" -c 'import torch, gsplat'
 
 echo "STEP 1: 8xH200 persistent SAM preprocessing"
@@ -96,6 +111,7 @@ echo "STEP 3: R9 loader contract"
   --waymo-root "${WAYMO_ROOT}" \
   --sam-root "${SAM_ROOT}" \
   --num-scenes 8
+"${UFO_PYTHON_BIN}" tools/r9/check_r9_training_input_contract.py
 
 echo "STEP 4: 8xH200 R9 throughput benchmark"
 export R9_SAM_TRACK_ROOT="${SAM_ROOT}"

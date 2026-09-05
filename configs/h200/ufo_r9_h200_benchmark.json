@@ -3,7 +3,6 @@
   "model": "UFO-B/8",
   "data_root": "data/UFO_paper",
   "dataset": "waymo",
-  "train_scene_indices": "621",
   "disable_validation": true,
   "input_size": [
     160,
@@ -17,7 +16,7 @@
   "paper_frame_protocol": true,
   "paper_supervision_mode": "final_scene",
   "paper_forward_flow_impl": false,
-  "batch_size": 1,
+  "batch_size": 8,
   "gradient_accumulation_steps": 1,
   "ddp_accumulation_no_sync": false,
   "attention_mode": "official_v1_dense",

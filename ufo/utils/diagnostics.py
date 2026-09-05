@@ -165,6 +165,26 @@ def gaussian_metrics(output_dict, max_scale=None):
         "bbox_pose_mean_translation", "bbox_pose_max_translation",
         "bbox_pose_mean_rotation_deg", "bbox_pose_max_rotation_deg",
         "bbox_motion_mean_displacement", "bbox_motion_max_displacement",
+        "renderer_coordinate_diagnostics_enabled", "renderer_diag_token_count",
+        "renderer_global_dynamic_gt_count",
+        "renderer_local_dynamic_gt_count",
+        "renderer_global_gaussian_dynamic_gt_count",
+        "renderer_global_gaussian_dynamic_gt_ratio",
+        "renderer_global_nearest_bbox_distance_mean",
+        "renderer_local_nearest_bbox_distance_mean",
+        "renderer_global_nearest_bbox_distance_min",
+        "renderer_local_nearest_bbox_distance_min",
+        "renderer_global_local_bbox_center_delta_mean",
+        "renderer_global_local_bbox_center_delta_max",
+        "r9_object_count",
+        "r9_dynamic_input_points",
+        "r9_fused_voxel_count",
+        "r9_fusion_ratio",
+        "r9_voxel_support_mean",
+        "r9_fusion_entropy_mean",
+        "r9_temporal_span_mean",
+        "r9_mean_residual_abs",
+        "r9_color_residual_abs",
     ):
         if key in output_dict:
             result[key] = output_dict[key].detach().float().item()
@@ -196,6 +216,8 @@ def parameter_grad_norms(model):
         "bbox_head_grad_norm": ("bbox_embed", "bbox_query_head", "bbox_key_head"),
         "lifespan_head_grad_norm": ("gs_life_pred",),
         "affine_grad_norm": ("affine_linear", "affine_token"),
+        "sam_motion_grad_norm": ("sam_object_motion_head",),
+        "r9_detail_grad_norm": ("sam_object_detail_head",),
     }
     result = {}
     named = list(model.named_parameters())

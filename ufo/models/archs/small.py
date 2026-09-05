@@ -572,6 +572,89 @@ class UFO(ViT):
         self.enable_mem_gs = False
         self.args = args
 
+        # R4/R5 object-level motion.
+        self.sam_object_motion_head = None
+
+        dynamic_mode_init = getattr(
+            args,
+            "dynamic_renderer_mode",
+            "bbox",
+        )
+
+        if dynamic_mode_init == "sam_object_motion":
+
+            from ufo.models.sam_object_motion import (
+                SAMObjectMotionHead,
+            )
+
+            self.sam_object_motion_head = SAMObjectMotionHead(
+                embed_dim=embed_dim,
+                hidden_dim=getattr(
+                    args,
+                    "sam_motion_hidden_dim",
+                    384,
+                ),
+                max_speed=getattr(
+                    args,
+                    "sam_motion_max_speed",
+                    20.0,
+                ),
+            )
+
+        elif dynamic_mode_init in (
+            "sam_object_canonical",
+            "sam_object_fusion",
+        ):
+
+            from ufo.models.sam_object_motion_r5 import (
+                SAMCanonicalObjectMotionHead,
+            )
+
+            self.sam_object_motion_head = (
+                SAMCanonicalObjectMotionHead(
+                    embed_dim=embed_dim,
+                    hidden_dim=getattr(
+                        args,
+                        "sam_motion_hidden_dim",
+                        384,
+                    ),
+                    max_speed=getattr(
+                        args,
+                        "sam_motion_max_speed",
+                        20.0,
+                    ),
+                )
+            )
+
+        self.sam_object_detail_head = None
+        if (
+            dynamic_mode_init == "sam_object_fusion"
+            and getattr(
+                args, "sam_canonical_fusion_impl", "gaussian_average"
+            ) == "feature_fusion"
+        ):
+            from ufo.models.sam_object_detail_r9 import (
+                SAMObjectDetailFusionHead,
+            )
+
+            self.sam_object_detail_head = SAMObjectDetailFusionHead(
+                embed_dim=embed_dim,
+                color_dim=gs_dim,
+                hidden_dim=getattr(args, "sam_r9_hidden_dim", 256),
+                max_mean_residual=getattr(
+                    args, "sam_r9_max_mean_residual", 0.08
+                ),
+                max_log_scale_residual=getattr(
+                    args, "sam_r9_max_log_scale_residual", 0.35
+                ),
+                max_quat_residual=getattr(
+                    args, "sam_r9_max_quat_residual", 0.20
+                ),
+                max_color_residual=getattr(
+                    args, "sam_r9_max_color_residual", 0.25
+                ),
+            )
+
         self.num_heads = num_heads
 
         self.static = static
@@ -1827,9 +1910,356 @@ class UFO(ViT):
 
         gs_params = self.forward_gs_predictor(x, data_dict['gs_origins'], data_dict['gs_dirs'])
 
-        # if self.num_motion_tokens > 0 and not self.static:
-        if motion:
-            data_dict = self.forward_motion_predictor_bbox(data_dict, gs_params)
+        dynamic_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
+
+        if dynamic_mode == "sam_object_fusion":
+
+            # During recurrent scene construction we only
+            # need Gaussian geometry for token locations.
+            # Running global association/fusion here would
+            # repeat it once per chunk for no benefit.
+            if data_dict.get(
+                "_r6_scene_update_only",
+                False,
+            ):
+                data_dict["class_loss"] = (
+                    x.sum() * 0.0
+                )
+
+                data_dict["gs_params"] = (
+                    gs_params
+                )
+
+                return data_dict
+
+            if self.sam_object_motion_head is None:
+                raise RuntimeError("canonical object motion head missing")
+
+            fusion_impl = getattr(
+                self.args,
+                "sam_canonical_fusion_impl",
+                "gaussian_average",
+            )
+
+            if fusion_impl == "feature_fusion":
+                from ufo.models.sam_object_detail_r9 import (
+                    predict_sam_detail_motion,
+                )
+
+                if self.sam_object_detail_head is None:
+                    raise RuntimeError(
+                        "R9 detail fusion head was not initialized"
+                    )
+
+                (
+                    forward_flow,
+                    global_track_ids,
+                    fused_params,
+                    r6_diag,
+                ) = predict_sam_detail_motion(
+                    gs_state=x,
+                    gs_params=gs_params,
+                    context_image=data_dict.get(
+                        "r9_context_image",
+                        data_dict["context_image"],
+                    ),
+                    local_track_ids=data_dict.get("sam_track_ids"),
+                    gs_time=data_dict["gs_time"],
+                    timespan=data_dict["timespan"],
+                    motion_head=self.sam_object_motion_head,
+                    detail_head=self.sam_object_detail_head,
+                    patch_size=self.unpatch_size,
+                    min_observations=getattr(
+                        self.args, "sam_motion_min_observations", 2
+                    ),
+                    min_track_pixels=getattr(
+                        self.args, "sam_r5_min_track_pixels", 16
+                    ),
+                    association_max_distance=getattr(
+                        self.args, "sam_r5_association_max_distance", 4.0
+                    ),
+                    association_min_overlap=getattr(
+                        self.args, "sam_r5_association_min_overlap", 1
+                    ),
+                    voxel_size=getattr(
+                        self.args, "sam_r9_voxel_size", 0.12
+                    ),
+                    min_voxel_support=getattr(
+                        self.args, "sam_r9_min_voxel_support", 1
+                    ),
+                    spatial_prior=getattr(
+                        self.args, "sam_r9_spatial_prior", 0.50
+                    ),
+                    temporal_prior=getattr(
+                        self.args, "sam_r9_temporal_prior", 0.25
+                    ),
+                )
+
+            elif fusion_impl == "gaussian_average":
+                from ufo.models.sam_object_motion_r6 import (
+                    predict_sam_fused_motion,
+                )
+
+                (
+                    forward_flow,
+                    global_track_ids,
+                    fused_params,
+                    r6_diag,
+                ) = predict_sam_fused_motion(
+                    gs_state=x,
+                    gs_params=gs_params,
+                    local_track_ids=data_dict.get("sam_track_ids"),
+                    gs_time=data_dict["gs_time"],
+                    timespan=data_dict["timespan"],
+                    motion_head=self.sam_object_motion_head,
+                    patch_size=self.unpatch_size,
+                    min_observations=getattr(
+                        self.args, "sam_motion_min_observations", 2
+                    ),
+                    min_track_pixels=getattr(
+                        self.args, "sam_r5_min_track_pixels", 16
+                    ),
+                    association_max_distance=getattr(
+                        self.args, "sam_r5_association_max_distance", 4.0
+                    ),
+                    association_min_overlap=getattr(
+                        self.args, "sam_r5_association_min_overlap", 1
+                    ),
+                    voxel_size=getattr(
+                        self.args, "sam_r6_voxel_size", 0.12
+                    ),
+                    min_voxel_support=getattr(
+                        self.args, "sam_r6_min_voxel_support", 1
+                    ),
+                )
+            else:
+                raise ValueError(
+                    f"unknown sam_canonical_fusion_impl={fusion_impl!r}"
+                )
+
+            for key in (
+                "means",
+                "scales",
+                "quats",
+                "opacities",
+                "colors",
+            ):
+                gs_params[key] = (
+                    fused_params[key]
+                )
+
+            gs_params["forward_flow"] = (
+                forward_flow
+            )
+
+            gs_params[
+                "r6_global_track_ids"
+            ] = global_track_ids
+
+            gs_params[
+                "r6_source_time_seconds"
+            ] = fused_params[
+                "source_time_seconds"
+            ]
+
+            gs_params[
+                "r6_active_mask"
+            ] = fused_params[
+                "active_mask"
+            ]
+
+            # R6 has no bbox/object-assignment branch.
+            data_dict["class_loss"] = (
+                x.sum() * 0.0
+            )
+
+            for key, value in (
+                r6_diag.items()
+            ):
+                if torch.is_tensor(value):
+                    data_dict[key] = value
+                else:
+                    data_dict[key] = (
+                        torch.tensor(
+                            float(value),
+                            device=x.device,
+                        )
+                    )
+
+        elif dynamic_mode == "sam_object_canonical":
+
+            from ufo.models.sam_object_motion_r5 import (
+                predict_sam_canonical_motion,
+            )
+
+            if self.sam_object_motion_head is None:
+                raise RuntimeError(
+                    "R5 canonical motion head "
+                    "was not initialized"
+                )
+
+            (
+                forward_flow,
+                global_track_ids,
+                canonical_keep,
+                r5_diag,
+            ) = predict_sam_canonical_motion(
+                gs_state=x,
+                means=gs_params["means"],
+                local_track_ids=data_dict.get(
+                    "sam_track_ids"
+                ),
+                gs_time=data_dict["gs_time"],
+                timespan=data_dict["timespan"],
+                motion_head=self.sam_object_motion_head,
+                patch_size=self.unpatch_size,
+                min_observations=getattr(
+                    self.args,
+                    "sam_motion_min_observations",
+                    2,
+                ),
+                min_track_pixels=getattr(
+                    self.args,
+                    "sam_r5_min_track_pixels",
+                    16,
+                ),
+                association_max_distance=getattr(
+                    self.args,
+                    "sam_r5_association_max_distance",
+                    4.0,
+                ),
+                association_min_overlap=getattr(
+                    self.args,
+                    "sam_r5_association_min_overlap",
+                    1,
+                ),
+            )
+
+            gs_params["forward_flow"] = forward_flow
+            gs_params["r5_global_track_ids"] = (
+                global_track_ids
+            )
+            gs_params["r5_canonical_keep"] = (
+                canonical_keep
+            )
+
+            for key, value in r5_diag.items():
+
+                if torch.is_tensor(value):
+                    data_dict[key] = value
+                else:
+                    data_dict[key] = torch.tensor(
+                        float(value),
+                        device=x.device,
+                    )
+
+            # Renderer still expects legacy bbox tensors.
+            # They remain background-only in pose-free mode.
+            if "bbox_weights" not in data_dict:
+                data_dict = (
+                    self.forward_motion_predictor_bbox(
+                        data_dict,
+                        gs_params,
+                    )
+                )
+
+        elif dynamic_mode == "sam_object_motion":
+
+            from ufo.models.sam_object_motion import (
+                predict_sam_object_velocity,
+            )
+
+            if self.sam_object_motion_head is None:
+                raise RuntimeError(
+                    "sam_object_motion head "
+                    "was not initialized"
+                )
+
+            forward_flow, sam_diag = (
+                predict_sam_object_velocity(
+                    gs_state=x,
+                    sam_track_ids=data_dict.get(
+                        "sam_track_ids"
+                    ),
+                    gs_time=data_dict["gs_time"],
+                    timespan=data_dict["timespan"],
+                    motion_head=(
+                        self.sam_object_motion_head
+                    ),
+                    patch_size=self.unpatch_size,
+                    min_observations=getattr(
+                        self.args,
+                        "sam_motion_min_observations",
+                        2,
+                    ),
+                )
+            )
+
+            gs_params["forward_flow"] = (
+                forward_flow
+            )
+
+            for key, value in sam_diag.items():
+                if torch.is_tensor(value):
+                    data_dict[key] = value
+                else:
+                    data_dict[key] = torch.tensor(
+                        float(value),
+                        device=x.device,
+                    )
+
+            # Legacy bbox information remains only because
+            # forward_renderer currently expects these fields.
+            # It does NOT control motion in this mode.
+            if "bbox_weights" not in data_dict:
+                data_dict = (
+                    self.forward_motion_predictor_bbox(
+                        data_dict,
+                        gs_params,
+                    )
+                )
+
+
+        # Both modes use the trained R3/STORM velocity head.
+        # sam_rigid only changes how per-Gaussian velocity is aggregated
+        # before rendering; it must NOT bypass velocity prediction.
+        elif dynamic_mode in ("storm_velocity", "sam_rigid"):
+            if self.num_motion_tokens <= 0:
+                raise RuntimeError(
+                    "storm_velocity requires num_motion_tokens > 0"
+                )
+
+            motion_tokens = data_dict.get("motion_tokens")
+            if motion_tokens is None:
+                raise RuntimeError(
+                    "storm_velocity requires motion_tokens from stage-1"
+                )
+
+            # STORM:
+            # image/scene features + motion tokens
+            # -> motion bases + per-Gaussian weights
+            # -> per-Gaussian velocity
+            gs_params = self.forward_motion_predictor(
+                x,
+                motion_tokens,
+                gs_params,
+            )
+
+            # Keep the existing bbox branch only as compatibility bookkeeping.
+            # In pose_free_camera_only mode all GT instances are suppressed and
+            # object_assignment_loss_coeff=0, so it cannot control motion.
+            if motion or 'bbox_weights' not in data_dict:
+                data_dict = self.forward_motion_predictor_bbox(
+                    data_dict,
+                    gs_params,
+                )
+
+        elif motion:
+            data_dict = self.forward_motion_predictor_bbox(
+                data_dict,
+                gs_params,
+            )
+
         else:
             assert 'bbox_weights' in data_dict
 

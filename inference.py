@@ -187,6 +187,35 @@ def build_dataset(args):
 # Inference
 # ---------------------------------------------------------------------------
 
+def concatenate_chunk_targets(inout_dicts):
+    """Combine every chunk's render inputs and GT along the target-time axis."""
+    if not inout_dicts:
+        raise ValueError("cannot concatenate targets from an empty chunk list")
+    render_input = inout_dicts[-1][0].copy()
+    target_keys = [
+        key for key in render_input
+        if key.startswith("target_") and isinstance(render_input[key], torch.Tensor)
+    ]
+    for key in target_keys:
+        values = [input_dict[key] for input_dict, _ in inout_dicts]
+        render_input[key] = torch.cat(values, dim=1)
+
+    # Preserve all recurrent RGB observations for R9's
+    # motion-aligned feature/appearance fusion.
+    render_input["r9_context_image"] = torch.cat(
+        [
+            input_dict["context_image"]
+            for input_dict, _ in inout_dicts
+        ],
+        dim=1,
+    )
+
+    target_dict = {}
+    for key in inout_dicts[0][1]:
+        values = [chunk_target[key] for _, chunk_target in inout_dicts]
+        target_dict[key] = torch.cat(values, dim=1)
+    return render_input, target_dict
+
 @torch.no_grad()
 def run_inference(model, dataset, args, device):
     """Run autoregressive inference on a single scene.

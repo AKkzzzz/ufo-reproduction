@@ -237,6 +237,100 @@ def get_args_parser():
         default="dummy",
     )
     parser.add_argument("--num_motion_tokens", default=16, type=int, help="Number of motion tokens")
+    parser.add_argument("--load_sam_tracks", action="store_true")
+    parser.add_argument("--sam_track_root", type=str, default="outputs/sam_tracks")
+    parser.add_argument("--sam_rigid_min_pixels", type=int, default=32)
+    parser.add_argument("--sam_rigid_max_speed", type=float, default=30.0)
+    parser.add_argument("--sam_dynamic_sigma", type=float, default=0.25)
+
+    parser.add_argument(
+        "--sam_motion_hidden_dim",
+        type=int,
+        default=384,
+    )
+    parser.add_argument(
+        "--sam_motion_max_speed",
+        type=float,
+        default=20.0,
+    )
+    parser.add_argument(
+        "--sam_motion_min_observations",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--train_sam_motion_only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--train_sam_r5",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sam_r5_min_track_pixels",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--sam_r5_association_max_distance",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--sam_r5_association_min_overlap",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--sam_r5_gs_lr_scale",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--sam_object_rgb_weight",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument(
+        "--sam_r6_voxel_size",
+        type=float,
+        default=0.12,
+    )
+    parser.add_argument(
+        "--sam_r6_min_voxel_support",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--train_sam_r6_fusion_only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sam_canonical_fusion_impl",
+        choices=["gaussian_average", "feature_fusion"],
+        default="gaussian_average",
+        help="R6 Gaussian averaging or R9 feature-level canonical fusion.",
+    )
+    parser.add_argument("--sam_r9_hidden_dim", type=int, default=256)
+    parser.add_argument("--sam_r9_voxel_size", type=float, default=0.12)
+    parser.add_argument("--sam_r9_min_voxel_support", type=int, default=1)
+    parser.add_argument("--sam_r9_max_mean_residual", type=float, default=0.08)
+    parser.add_argument("--sam_r9_max_log_scale_residual", type=float, default=0.35)
+    parser.add_argument("--sam_r9_max_quat_residual", type=float, default=0.20)
+    parser.add_argument("--sam_r9_max_color_residual", type=float, default=0.25)
+    parser.add_argument("--sam_r9_spatial_prior", type=float, default=0.50)
+    parser.add_argument("--sam_r9_temporal_prior", type=float, default=0.25)
+    parser.add_argument(
+        "--sam_object_edge_weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--dynamic_renderer_mode",
+        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion", "sam_object_canonical", "sam_object_fusion"],
+        default="bbox",
+        help="bbox: legacy UFO bbox transform; storm_velocity: Gaussian velocity * delta_t.",
+    )
     parser.add_argument("--filter_num", default=3600, type=int, help="Number of visible tokens to keep when filtering scene (k for top-k filtering)")
 
     # =============== Losses =============== #
@@ -1090,31 +1184,174 @@ def main(args):
 
             if final_scene_supervision:
                 if args.sequential_chunk_backward:
-                    raise ValueError("final_scene supervision requires one backward after all renders")
-                for (render_source, target_dict), update_output in zip(
-                    final_scene_inputs, final_scene_update_outputs
+                    raise ValueError(
+                        "final_scene supervision requires "
+                        "one backward after all renders"
+                    )
+
+                # ------------------------------------------------
+                # R6/R9 canonical fusion is scene-level work.
+                #
+                # Do it ONCE for the accumulated recurrent scene,
+                # then reuse the fused Gaussian state for every
+                # supervision target.
+                #
+                # This is both the correct R9 semantics and avoids
+                # repeating expensive association/fusion for every
+                # target render.
+                # ------------------------------------------------
+                r6_cached_stage2 = None
+
+                if (
+                    getattr(
+                        args,
+                        "dynamic_renderer_mode",
+                        "bbox",
+                    )
+                    == "sam_object_fusion"
                 ):
-                    render_input = render_source.copy()
-                    render_input.update(all_gs_features)
-                    render_input = model(render_input, stage=2, motion=False)
-                    pred_dict = model(render_input, stage=3)
-                    loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
-                    if 'class_loss' in update_output:
-                        loss_dict['class_loss'] = update_output['class_loss']
-                    if 'ray_loss' in update_output:
-                        loss_dict['ray_loss'] = update_output['ray_loss']
-                    loss_value = sum(loss for key, loss in loss_dict.items() if "loss" in key)
+                    r6_stage2_input = (
+                        final_scene_inputs[0][0].copy()
+                    )
+
+                    r6_stage2_input.update(
+                        all_gs_features
+                    )
+
+                    # R9 feature fusion needs the complete RGB
+                    # evidence stream aligned with accumulated GS.
+                    if getattr(
+                        args,
+                        "sam_canonical_fusion_impl",
+                        "gaussian_average",
+                    ) == "feature_fusion":
+                        r6_stage2_input[
+                            "r9_context_image"
+                        ] = torch.cat(
+                            [
+                                chunk_input["context_image"]
+                                for chunk_input, _
+                                in final_scene_inputs
+                            ],
+                            dim=1,
+                        )
+
+                    r6_cached_stage2 = model(
+                        r6_stage2_input,
+                        stage=2,
+                        motion=False,
+                    )
+
+                for (
+                    render_source,
+                    target_dict,
+                ), update_output in zip(
+                    final_scene_inputs,
+                    final_scene_update_outputs,
+                ):
+                    render_input = (
+                        render_source.copy()
+                    )
+
+                    render_input.update(
+                        all_gs_features
+                    )
+
+                    if r6_cached_stage2 is not None:
+                        render_input["gs_params"] = (
+                            r6_cached_stage2[
+                                "gs_params"
+                            ]
+                        )
+                    else:
+                        # Baseline UFO / non-R9 path remains
+                        # exactly the H200 runnable behavior.
+                        render_input = model(
+                            render_input,
+                            stage=2,
+                            motion=False,
+                        )
+
+                    pred_dict = model(
+                        render_input,
+                        stage=3,
+                    )
+
+                    loss_dict = compute_loss(
+                        pred_dict,
+                        target_dict,
+                        args,
+                        rgb_and_lpips_loss,
+                    )
+
+                    if "class_loss" in update_output:
+                        loss_dict["class_loss"] = (
+                            update_output[
+                                "class_loss"
+                            ]
+                        )
+
+                    if "ray_loss" in update_output:
+                        loss_dict["ray_loss"] = (
+                            update_output[
+                                "ray_loss"
+                            ]
+                        )
+
+                    loss_value = sum(
+                        loss
+                        for key, loss
+                        in loss_dict.items()
+                        if "loss" in key
+                    )
+
                     loss_total += loss_value
+
                     for key, value in loss_dict.items():
-                        loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
+                        loss_dict_accum[key] = (
+                            loss_dict_accum.get(
+                                key,
+                                0.0,
+                            )
+                            + value.detach()
+                        )
+
                     if collect_step_diagnostics:
                         with torch.no_grad():
-                            chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
-                            chunk_metrics.update(assignment_metrics(pred_dict))
+                            chunk_metrics = (
+                                reconstruction_metrics(
+                                    pred_dict,
+                                    target_dict,
+                                )
+                            )
+
+                            chunk_metrics.update(
+                                assignment_metrics(
+                                    pred_dict
+                                )
+                            )
+
                             if collect_gaussian_diagnostics:
-                                chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
-                            for key, value in chunk_metrics.items():
-                                accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
+                                chunk_metrics.update(
+                                    gaussian_metrics(
+                                        pred_dict,
+                                        args.max_gaussian_scale,
+                                    )
+                                )
+
+                            for (
+                                key,
+                                value,
+                            ) in chunk_metrics.items():
+                                accumulation_metric_dict[
+                                    key
+                                ] = (
+                                    accumulation_metric_dict.get(
+                                        key,
+                                        0.0,
+                                    )
+                                    + value
+                                )
 
             loss_dict = {key: value / len(inout_dicts) for key, value in loss_dict_accum.items()}
             for key, value in loss_dict.items():
